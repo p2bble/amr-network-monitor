@@ -1,0 +1,19 @@
+[Unit]
+Description=AMR Network Monitoring Agent (HD-BaseAir)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=clobot
+WorkingDirectory=/home/clobot/wifi_agent
+ExecStart=/usr/bin/python3 /home/clobot/wifi_agent/amr_unified_agent.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=amr-agent
+
+[Install]
+WantedBy=multi-user.target

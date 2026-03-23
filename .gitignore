@@ -1,0 +1,34 @@
+# Flutter / Dart
+amr_monitor/build/
+amr_monitor/.dart_tool/
+amr_monitor/.flutter-plugins
+amr_monitor/.flutter-plugins-dependencies
+amr_monitor/.pub-cache/
+amr_monitor/.pub/
+amr_monitor/doc/api/
+
+# Android
+amr_monitor/android/.gradle/
+amr_monitor/android/local.properties
+amr_monitor/android/key.properties
+
+# iOS / macOS
+amr_monitor/ios/Pods/
+amr_monitor/ios/.symlinks/
+amr_monitor/macos/Pods/
+amr_monitor/macos/.symlinks/
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
