@@ -1,0 +1,19 @@
+[Unit]
+Description=AMR Infrastructure Monitor (AP / Switch ping)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=clobot
+WorkingDirectory=/home/clobot/amr_deploy
+ExecStart=/usr/bin/python3 /home/clobot/amr_deploy/infra_monitor.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=infra-monitor
+
+[Install]
+WantedBy=multi-user.target

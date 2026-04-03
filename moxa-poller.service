@@ -1,0 +1,14 @@
+[Unit]
+Description=MOXA SNMP Poller (server-side channel/SSID/BSSID)
+After=network-online.target
+
+[Service]
+Type=simple
+User=clobot
+WorkingDirectory=/home/clobot/amr_deploy
+ExecStart=/usr/bin/python3 /home/clobot/amr_deploy/moxa_snmp_poller.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
