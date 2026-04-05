@@ -56,13 +56,10 @@ def log_event(event_type: str, message: str):
 
 # ── 환경 감지 ────────────────────────────────────────────────
 def detect_environment():
-    if not MOXA_IP:
-        return "NATIVE"
-    try:
-        subprocess.check_output(['ping', '-c', '1', '-W', '1', MOXA_IP], stderr=subprocess.STDOUT)
-        return "MOXA"
-    except subprocess.CalledProcessError:
-        return "NATIVE"
+    # MOXA_IP가 설정돼 있으면 무조건 MOXA 모드.
+    # 과거에는 MOXA ping 성공 여부로 판단했으나, MOXA 데이터는 서버 MQTT에서 수신하므로
+    # 부팅 시 MOXA ping 실패가 NATIVE 폴백을 유발하는 문제 수정.
+    return "MOXA" if MOXA_IP else "NATIVE"
 
 def ping_server():
     try:
