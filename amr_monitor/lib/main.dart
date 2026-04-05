@@ -593,6 +593,13 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
   DateTime? _lastDataTime;
   Timer? _ticker;
 
+  // 서버 진단 요약 (amr_diagnostics.py → infra_test/diagnosis/summary)
+  List<Map<String, dynamic>> _crossFaults = [];
+  int _diagOnline      = 0;
+  int _diagAlertCount  = 0;
+  int _diagNormalCount = 0;
+  List<String> _diagOffline = [];
+
   static const int _dataTimeoutSec = 30;
 
   String get _connectionLabel {
@@ -661,7 +668,14 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
           if (!_disposed) {
             setState(() {
               _lastDataTime = DateTime.now();
-              if (topic.startsWith('infra_test/network_infra/')) {
+              if (topic == 'infra_test/diagnosis/summary') {
+                _crossFaults     = List<Map<String, dynamic>>.from(
+                    json['cross_faults'] as List? ?? []);
+                _diagOnline      = (json['online']       as num? ?? 0).toInt();
+                _diagAlertCount  = (json['alert_count']  as num? ?? 0).toInt();
+                _diagNormalCount = (json['normal_count'] as num? ?? 0).toInt();
+                _diagOffline     = List<String>.from(json['offline'] as List? ?? []);
+              } else if (topic.startsWith('infra_test/network_infra/')) {
                 final did = json['device_id'] as String? ?? '';
                 if (did.isNotEmpty) {
                   infraDevices.putIfAbsent(did, () => InfraDevice());
@@ -691,12 +705,14 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
     if (!_disposed) setState(() => isConnected = true);
     client.subscribe('infra_test/network_status/#',  MqttQos.atMostOnce);
     client.subscribe('infra_test/network_infra/#',   MqttQos.atMostOnce);
+    client.subscribe('infra_test/diagnosis/summary', MqttQos.atMostOnce);
   }
   void _onDisconnected()    { if (!_disposed) setState(() => isConnected = false); }
   void _onAutoReconnected() {
     if (!_disposed) setState(() => isConnected = true);
     client.subscribe('infra_test/network_status/#',  MqttQos.atMostOnce);
     client.subscribe('infra_test/network_infra/#',   MqttQos.atMostOnce);
+    client.subscribe('infra_test/diagnosis/summary', MqttQos.atMostOnce);
   }
 
   @override
@@ -741,6 +757,7 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
         ],
       ),
       body: Column(children: [
+        if (_crossFaults.isNotEmpty || _diagOffline.isNotEmpty) _buildDiagBanner(),
         if (infraDevices.isNotEmpty) _buildInfraPanel(),
         if (robots.isEmpty)
           const Expanded(
@@ -763,6 +780,98 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
           ],
         ],
       ]),
+    );
+  }
+
+  // ============================================================
+  // [D-0] 서버 자동 진단 배너 (amr_diagnostics.py 결과)
+  // ============================================================
+  Widget _buildDiagBanner() {
+    final layerColors = {
+      'backbone': Colors.red.shade700,
+      'ap':       Colors.orange.shade700,
+      'channel':  Colors.amber.shade800,
+      'moxa':     Colors.deepOrange.shade700,
+      'network':  Colors.orange.shade800,
+      'agent':    Colors.deepOrange.shade900,
+    };
+    final layerIcons = {
+      'backbone': Icons.device_hub,
+      'ap':       Icons.router,
+      'channel':  Icons.wifi_tethering,
+      'moxa':     Icons.settings_ethernet,
+      'network':  Icons.network_check,
+      'agent':    Icons.computer,
+    };
+
+    return Container(
+      width: double.infinity,
+      color: Colors.red.shade900.withOpacity(0.92),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 헤더 행
+          Row(children: [
+            const Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 16),
+            const SizedBox(width: 6),
+            Text(
+              '자동 진단 알림  |  이상 $_diagAlertCount대 / 정상 $_diagNormalCount대 / 오프라인 ${_diagOffline.length}대',
+              style: const TextStyle(
+                  color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+            ),
+          ]),
+          // 크로스 진단 항목
+          if (_crossFaults.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            ..._crossFaults.map((cf) {
+              final layer  = cf['layer'] as String? ?? '';
+              final color  = layerColors[layer] ?? Colors.grey.shade700;
+              final icon   = layerIcons[layer]  ?? Icons.warning;
+              final ids    = (cf['ids'] as List?)?.join(', ') ?? '';
+              return Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Row(children: [
+                  Icon(icon, color: Colors.white70, size: 13),
+                  const SizedBox(width: 5),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: color,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      cf['summary'] as String? ?? '',
+                      style: const TextStyle(
+                          color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      ids.isNotEmpty ? '[$ids]  ${cf['action'] ?? ''}' : (cf['action'] ?? ''),
+                      style: const TextStyle(color: Colors.white70, fontSize: 11),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ]),
+              );
+            }),
+          ],
+          // 오프라인 로봇
+          if (_diagOffline.isNotEmpty) ...[
+            const SizedBox(height: 3),
+            Row(children: [
+              const Icon(Icons.power_off, color: Colors.white38, size: 13),
+              const SizedBox(width: 5),
+              Text(
+                '오프라인: ${_diagOffline.join(', ')}',
+                style: const TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+            ]),
+          ],
+        ],
+      ),
     );
   }
 

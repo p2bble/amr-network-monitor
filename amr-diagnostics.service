@@ -1,0 +1,17 @@
+[Unit]
+Description=AMR Auto Diagnostics Service
+After=network.target emqx.service
+Wants=emqx.service
+
+[Service]
+Type=simple
+User=clobot
+WorkingDirectory=/home/clobot/amr_deploy
+ExecStart=/usr/bin/python3 /home/clobot/amr_deploy/amr_diagnostics.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

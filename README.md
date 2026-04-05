@@ -26,6 +26,8 @@ amr_unified_agent.py              EMQX :1883 (TCP)
 | `moxa-poller.service` | 서버 | moxa_snmp_poller systemd 서비스 |
 | `infra_monitor.py` | 서버 | AP/스위치 인프라 상태 모니터 |
 | `infra-monitor.service` | 서버 | infra_monitor systemd 서비스 |
+| `amr_diagnostics.py` | 서버 | 자동 장애 진단 서비스 (크로스 로봇 분석) |
+| `amr-diagnostics.service` | 서버 | amr_diagnostics systemd 서비스 |
 | `amr_monitor/` | 서버 | Flutter 관제 웹 앱 |
 
 ### 에이전트 동작 모드
@@ -94,12 +96,31 @@ amr_unified_agent.py              EMQX :1883 (TCP)
 
 ### 자동 장애 진단
 
+**클라이언트 진단** (대시보드 열람 중에만 동작)
+
 | 계층 | 진단 기준 |
 |------|-----------|
 | RF/AP | RSSI < -75 dBm (WARN) / < -85 dBm 3회 연속 (CRIT) |
 | MOXA | SNMP 무응답 → Ch Error / RSSI N/A |
 | GW Ping | 100 ms 초과 (WARN) / 500 ms 초과 (CRIT) |
 | 에이전트 | 30초 이상 무응답 (CRIT) |
+| TX Retry | 20% 이상 (간섭 의심) / 30% 이상 (심각) — 동일 AP 타 로봇 비교로 국소/공통 분류 |
+
+**서버 자동 진단** (`amr_diagnostics.py` — 24/7 상시 동작, 10초 주기)
+
+| 패턴 | 진단 | 설명 |
+|------|------|------|
+| 에이전트 60초 무응답 | `agent` | 에이전트 크래시 / 전원 이상 |
+| RSSI < -75 + 10분간 로밍 없음 | `moxa` | MOXA 로밍 고착 |
+| RSSI < -85 | `ap` | AP 음영구간 |
+| 동일 BSSID 2대 이상 동시 이상 | `ap` | AP 장애 의심 |
+| 동일 채널 3대 이상 동시 이상 | `channel` | 채널 간섭 의심 |
+| 온라인 로봇 50% 이상 동시 이상 | `backbone` | 서버·백본 스위치 장애 |
+| Ping > 500 ms | `network` | 네트워크 심각 지연 |
+
+- 결과는 `infra_test/diagnosis/summary` 및 `infra_test/diagnosis/{robot_id}` MQTT 토픽으로 발행
+- 대시보드 상단에 빨간 배너로 실시간 표시 (크로스 진단 + 오프라인 목록)
+- 로그 영구 보존: `/home/clobot/amr_deploy/logs/diagnostics.log` (50MB 롤오버)
 
 ### UI 뷰 모드
 - **테이블 뷰** (기본): 로봇ID / 진단상태 / RSSI / Retry / Ping / 채널 / 마지막수신
@@ -173,7 +194,7 @@ amr_unified_agent.py              EMQX :1883 (TCP)
 ### 서비스 상태 확인
 
 ```bash
-sudo systemctl status infra-monitor moxa-poller
+sudo systemctl status infra-monitor moxa-poller amr-diagnostics
 ```
 
 ### 서비스 재시작
@@ -181,6 +202,7 @@ sudo systemctl status infra-monitor moxa-poller
 ```bash
 sudo systemctl restart moxa-poller
 sudo systemctl restart infra-monitor
+sudo systemctl restart amr-diagnostics
 ```
 
 ### 로그 확인
@@ -188,6 +210,9 @@ sudo systemctl restart infra-monitor
 ```bash
 sudo journalctl -u moxa-poller -n 30 --no-pager
 sudo journalctl -u infra-monitor -n 30 --no-pager
+sudo journalctl -u amr-diagnostics -n 30 --no-pager
+# 진단 이력 파일
+tail -f /home/clobot/amr_deploy/logs/diagnostics.log
 ```
 
 ### 파일 위치 (서버)
@@ -197,8 +222,21 @@ sudo journalctl -u infra-monitor -n 30 --no-pager
   ├── amr_unified_agent.py      # 로봇 에이전트 (배포용 원본)
   ├── moxa_snmp_poller.py       # MOXA SNMP 폴러
   ├── infra_monitor.py          # AP/스위치 인프라 모니터
+  ├── amr_diagnostics.py        # 자동 장애 진단 서비스
   ├── moxa-poller.service       # (참고용)
-  └── infra-monitor.service     # (참고용)
+  ├── infra-monitor.service     # (참고용)
+  └── amr-diagnostics.service   # (참고용)
+```
+
+### `amr-diagnostics.service` 신규 배포
+
+```bash
+scp -P 10022 amr_diagnostics.py clobot@10.10.150.119:/home/clobot/amr_deploy/
+scp -P 10022 amr-diagnostics.service clobot@10.10.150.119:/tmp/
+sudo cp /tmp/amr-diagnostics.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable amr-diagnostics
+sudo systemctl start amr-diagnostics
 ```
 
 ---
@@ -316,6 +354,10 @@ curl -s -u admin:public "http://localhost:8081/api/v4/clients?page_size=50" | \
 
 | 날짜 | 내용 |
 |------|------|
+| 2026-04-05 | `amr_diagnostics.py` 추가 — 서버 24/7 자동 진단 서비스 (크로스 로봇 패턴 분석) |
+| 2026-04-05 | 대시보드 상단 글로벌 진단 배너 추가 (cross_faults, 오프라인 목록 실시간 표시) |
+| 2026-04-05 | `amr-diagnostics.service` systemd 서비스 파일 추가 |
+| 2026-04-03 | MOXA Device Reboot 비활성화, 로밍 임계값 -70dBm, 로밍 차이 8dBm 설정 |
 | 2026-04-03 | MOXA 1.11.17.1 OID 발견 — RSSI/채널/SNR/Noise 실측값 수집 가능 확인 |
 | 2026-04-03 | moxa_snmp_poller.py OID 전면 교체 (1.5.x 설정값 → 1.11.17.1 live 테이블) |
 | 2026-04-03 | 서버사이드 MOXA 폴러 아키텍처 도입 (moxa-poller.service 배포) |

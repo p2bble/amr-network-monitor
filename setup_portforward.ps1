@@ -23,12 +23,13 @@ function Add-Proxy($lp, $cp, $label) {
 
 # [A] Server / Dashboard
 Write-Host "`n[2] Server / Dashboard" -ForegroundColor Yellow
+Add-Proxy 10080 80    "CROMS Web"
 Add-Proxy 10022 10022 "Server SSH"
 Add-Proxy 9090  9090  "AMR Dashboard"
 Add-Proxy 8083  8083  "MQTT WebSocket"
 Add-Proxy 18083 18083 "EMQX Console"
 netsh advfirewall firewall delete rule name="AMR-Server" | Out-Null
-netsh advfirewall firewall add rule name="AMR-Server" protocol=TCP dir=in localport="10022,9090,8083,18083" action=allow | Out-Null
+netsh advfirewall firewall add rule name="AMR-Server" protocol=TCP dir=in localport="10080,10022,9090,8083,18083" action=allow | Out-Null
 
 # [B] Robot SSH (9101~9113)
 Write-Host "`n[3] Robot SSH (9101-9113)" -ForegroundColor Yellow
@@ -79,7 +80,8 @@ $myIp = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
 Write-Host "`n=====================================================" -ForegroundColor Cyan
 Write-Host "  Access Info  (My VPN IP: $myIp)" -ForegroundColor Cyan
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "  Dashboard        : http://${myIp}:9090" -ForegroundColor White
+Write-Host "  CROMS 관제       : http://${myIp}:10080/monitoring/control" -ForegroundColor White
+Write-Host "  AMR Dashboard    : http://${myIp}:9090" -ForegroundColor White
 Write-Host "  Server SSH       : ssh -p 10022 clobot@${myIp}" -ForegroundColor White
 Write-Host "  EMQX Console     : http://${myIp}:18083  (admin/public)" -ForegroundColor White
 Write-Host "  Robot SSH AMR-01 : ssh -p 9101 thira@${myIp}" -ForegroundColor White
