@@ -137,6 +137,15 @@ class DiagnosisEngine {
         badgeColor: Colors.orange,
       );
     }
+    if (!d.rssiAvailable) {
+      return DiagnosisResult(
+        layer: FaultLayer.moxa,
+        summary: 'MOXA SNMP 미수신',
+        detail: 'RSSI/채널 데이터 없음 — moxa-poller 또는 MOXA SNMP 설정 확인',
+        action: 'sudo systemctl status moxa-poller\n→ MOXA 웹UI: SNMP Enable + Save Configuration + 재부팅',
+        badgeColor: Colors.orange,
+      );
+    }
     if (d.currentRssi < _rssiCritical) {
       return DiagnosisResult(
         layer: FaultLayer.ap,
@@ -277,6 +286,7 @@ class RobotData {
   String currentSsid = "";
   String currentChannel = "";
   int currentRssi = 0;
+  bool rssiAvailable = false;   // false = "N/A" / "Error" (MOXA SNMP 미수신)
 
   // 확장 필드 (에이전트가 보낼 때 자동 활성화, -1 = 미지원)
   double pingGwMs    = -1;
@@ -367,7 +377,10 @@ class RobotData {
     if (json['freq_mhz']      != null) freqMhz     = (json['freq_mhz']      as num).toInt();
     if (json['band']          != null) band        = json['band'];
 
-    int newRssi = int.tryParse(json['rssi'].toString().replaceAll('dBm', '').trim()) ?? -100;
+    final rssiRaw = json['rssi']?.toString().replaceAll('dBm', '').trim() ?? '';
+    final rssiParsed = int.tryParse(rssiRaw);
+    rssiAvailable = rssiParsed != null;
+    int newRssi = rssiParsed ?? 0;   // N/A → 0 (임계값 오탐 방지)
 
     // ── 로밍 감지 ──────────────────────────────────────────
     if (currentBssid.isNotEmpty && currentBssid != json['bssid'] && json['bssid'] != "Disconnected") {
@@ -384,7 +397,8 @@ class RobotData {
     }
     _prevStatus = status;
 
-    // ── RSSI 임계값 교차 감지 (debounce: 3초 연속 시에만 이벤트) ──
+    // ── RSSI 임계값 교차 감지 (debounce: 3초 연속 시에만 이벤트, SNMP 미수신 시 스킵) ──
+    if (!rssiAvailable) { _rssiCritCount = 0; _rssiWarnCount = 0; }
     // Critical (-85 dBm): 3회 연속 진입/탈출 시에만 로그 (순간 노이즈 오탐 방지)
     if (currentRssi < _rssiCritThreshold) {
       _rssiCritCount++;
