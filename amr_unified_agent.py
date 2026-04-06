@@ -12,7 +12,7 @@ from datetime import datetime
 # ================= [1] 인프라 및 통신 설정 =================
 SERVER_IP   = "192.168.145.5"
 MOXA_IP     = "192.167.140.1"
-ROBOT_ID    = "HD-BaseAir-002"      # 로봇별 배포 시 변경
+ROBOT_ID    = "sebang001"            # 로봇별 배포 시 변경
 
 WLAN_IFACE  = "wlxb0386cf45145"     # 로봇별 배포 시 변경
 LAN_IFACE   = "eth0"

@@ -317,6 +317,89 @@ docker run -d \
 
 ---
 
+## 4. AP 설정 가이드 (H3C WA6320, 펌웨어 7.1.064)
+
+### AP별 채널 / IP
+
+| AP | IP | 채널 | max-power |
+|----|----|------|-----------|
+| AP-01 | 192.168.145.31 | Ch 36 | 14dBm |
+| AP-02 | 192.168.145.32 | Ch 157 | 20dBm |
+| AP-03 | 192.168.145.33 | Ch 36 | 14dBm |
+| AP-04 | 192.168.145.34 | Ch 157 | 20dBm |
+| AP-05 | 192.168.145.35 | — | 미운영 |
+| AP-06 | 192.168.145.36 | Ch 161 | 20dBm |
+| AP-07 | 192.168.145.37 | Ch 149 | 20dBm |
+| AP-08 | 192.168.145.38 | Ch 161 | 20dBm |
+| AP-09 | 192.168.145.39 | Ch 149 | 20dBm |
+| AP-10 | 192.168.145.40 | — | 미운영 |
+| AP-11 | 192.168.145.41 | Ch 157 | 20dBm |
+| AP-12 | 192.168.145.42 | Ch 161 | 20dBm |
+| AP-13 | 192.168.145.43 | — | 미운영 |
+| AP-14 | 192.168.145.44 | Ch 157 | 20dBm |
+| AP-15 | 192.168.145.45 | Ch 36 | 14dBm |
+
+### AP SSH 접속 (서버 경유)
+
+```bash
+ssh -p 10022 clobot@10.10.150.119   # 서버 접속
+ssh admin@192.168.145.31             # AP-01 접속 (password: sebang1234)
+```
+
+### AP 설정 적용 (Ch 36용 — max-power 14)
+
+```
+system-view
+wlan service-template 1
+undo service-template enable
+undo cipher-suite tkip
+service-template enable
+quit
+interface WLAN-Radio1/0/1
+max-power 14
+quit
+save force
+quit
+```
+
+### AP 설정 적용 (Ch 149/157/161용 — max-power 20)
+
+```
+system-view
+wlan service-template 1
+undo service-template enable
+undo cipher-suite tkip
+service-template enable
+quit
+interface WLAN-Radio1/0/1
+max-power 20
+quit
+save force
+quit
+```
+
+### 펌웨어 7.1.064 미지원 기능
+
+- `dot11r` (802.11r Fast BSS Transition) — 미지원
+- `dot11k` (802.11k Neighbor Report) — 미지원
+- `wlan rrm` / `station-kick rssi` — 미지원
+- `quick-association enable` 이미 설정됨 (OKC/PMK 캐싱으로 부분 대체)
+
+> **주의**: 서비스 템플릿 변경 시 `undo service-template enable` 먼저 실행 필수.
+> max-power 범위: Ch 36 → 1~14dBm / Ch 149/157/161 → 1~24dBm
+
+### MOXA 로밍 설정 권장값 (AWK-1137C 웹UI)
+
+| 항목 | 현재 | 권장 | 이유 |
+|------|------|------|------|
+| roamingDifference5G | 5 | **8** | 핑퐁 로밍 방지 |
+| roamingThreshold5G_Signal | -70 | **-75** | 불필요한 로밍 감소 |
+| rmtConnCheckRebootDevice | ENABLE | **DISABLE** | 서버 ping 실패 시 재부팅 방지 |
+| rmtConnCheckCheckTimeout | 1000ms | **2000ms** | 안정적 판정 |
+| rmtConnCheckRetryInterval | 1 | **3** | timeout보다 커야 함 |
+
+---
+
 ## 트러블슈팅
 
 ### RSSI N/A 또는 Ch Error 표시
@@ -354,6 +437,10 @@ curl -s -u admin:public "http://localhost:8081/api/v4/clients?page_size=50" | \
 
 | 날짜 | 내용 |
 |------|------|
+| 2026-04-06 | H3C WA6320 AP 설정 적용: undo cipher-suite tkip, max-power 14/20 (채널별) |
+| 2026-04-06 | MOXA 환경 감지 수정: ping 체크 제거 → MOXA_IP 설정 시 항상 MOXA 모드 |
+| 2026-04-06 | RSSI N/A 오탐 수정: rssiAvailable 필드 추가, MOXA SNMP 미수신 진단 구분 |
+| 2026-04-06 | ROBOT_ID 템플릿 HD-BaseAir-002 → sebang001 통일 |
 | 2026-04-05 | `amr_diagnostics.py` 추가 — 서버 24/7 자동 진단 서비스 (크로스 로봇 패턴 분석) |
 | 2026-04-05 | 대시보드 상단 글로벌 진단 배너 추가 (cross_faults, 오프라인 목록 실시간 표시) |
 | 2026-04-05 | `amr-diagnostics.service` systemd 서비스 파일 추가 |
