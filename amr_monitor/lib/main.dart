@@ -290,7 +290,9 @@ class RobotData {
 
   // 확장 필드 (에이전트가 보낼 때 자동 활성화, -1 = 미지원)
   double pingGwMs    = -1;
+  double pingMoxaMs  = -1;
   double pingSrvMs   = -1;
+  String latencySrc  = "";
   double packetLoss  = -1;
   double cpuPct      = -1;
   double memPct      = -1;
@@ -299,6 +301,7 @@ class RobotData {
   String vlanId      = "";
   int    ifErrors    = 0;
   int    reconnectCount = 0;
+  int    _prevReconnectCount = 0;
 
   // 채널 품질 필드 (iw station dump 기반, -1 = 미지원)
   double txRetryRate = -1;
@@ -355,7 +358,9 @@ class RobotData {
     lastTime       = json['timestamp'];
 
     if (json['ping_gw_ms']      != null) pingGwMs      = (json['ping_gw_ms']      as num).toDouble();
+    if (json['ping_moxa_ms']    != null) pingMoxaMs    = (json['ping_moxa_ms']    as num).toDouble();
     if (json['ping_srv_ms']     != null) pingSrvMs     = (json['ping_srv_ms']     as num).toDouble();
+    if (json['latency_src']     != null) latencySrc    = json['latency_src'].toString();
     if (json['packet_loss']     != null) packetLoss    = (json['packet_loss']     as num).toDouble();
     if (json['cpu_pct']         != null) cpuPct        = (json['cpu_pct']         as num).toDouble();
     if (json['mem_pct']         != null) memPct        = (json['mem_pct']         as num).toDouble();
@@ -444,7 +449,8 @@ class RobotData {
       _addLog("AGT", "${json['latest_log']}");
     }
     if (packetLoss > 5)        _addLog("WARN", "패킷 손실: ${packetLoss.toInt()}%");
-    if (reconnectCount > 0)    _addLog("SYS",  "에이전트 재연결 누적: $reconnectCount 회");
+    if (reconnectCount > _prevReconnectCount) _addLog("SYS",  "에이전트 재연결 누적: $reconnectCount 회");
+    _prevReconnectCount = reconnectCount;
 
     pingHistory.add(FlSpot(timeIndex, currentPing));
     rssiHistory.add(FlSpot(timeIndex, currentRssi.toDouble()));
@@ -1080,7 +1086,7 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
         Expanded(flex: 3, child: _thCell("로봇 ID")),
         Expanded(flex: 4, child: _thCell("진단 상태")),
         Expanded(flex: 2, child: _thCell("RSSI")),
-        Expanded(flex: 2, child: _thCell("Retry")),
+        Expanded(flex: 2, child: _thCell("경로")),
         Expanded(flex: 2, child: _thCell("Ping")),
         Expanded(flex: 3, child: _thCell("채널")),
         Expanded(flex: 2, child: _thCell("마지막 수신")),
@@ -1109,12 +1115,6 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
     final isExpanded = _expandedTableRow == data.id;
     final isStale    = data.lastReceived != null &&
         DateTime.now().difference(data.lastReceived!).inSeconds > _dataTimeoutSec;
-
-    final retryColor = data.txRetryRate < 0  ? Colors.grey
-        : data.txRetryRate > 30              ? Colors.red
-        : data.txRetryRate > 20              ? Colors.deepOrange
-        : data.txRetryRate > 10              ? Colors.amber
-        :                                      Colors.green;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1175,11 +1175,8 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
               // RSSI
               Expanded(flex: 2, child: _tdValue(
                   '${data.currentRssi}', 'dBm', _rssiColor(data.currentRssi))),
-              // Retry
-              Expanded(flex: 2, child: data.txRetryRate >= 0
-                  ? _tdValue(
-                      data.txRetryRate.toStringAsFixed(1), '%', retryColor)
-                  : _tdDash()),
+              // 경로 (latency_src)
+              Expanded(flex: 2, child: _buildLatencySrcBadge(data.latencySrc)),
               // Ping
               Expanded(flex: 2, child: _tdValue(
                   '${data.currentPing.toInt()}', 'ms',
@@ -1248,6 +1245,11 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
           ),
         ]),
         const SizedBox(height: 8),
+        // Ping 3단계 경로 분석 (MOXA 모드)
+        if (data.pingMoxaMs >= 0 || data.pingGwMs >= 0) ...[
+          _buildPingBreakdown(data),
+          const SizedBox(height: 8),
+        ],
         // 채널 품질 바
         if (data.txRetryRate >= 0) ...[
           _buildChannelQualityBar(data),
@@ -1307,6 +1309,120 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
         ),
       ]),
     );
+  }
+
+  // ============================================================
+  // [E-ping] Ping 3단계 경로 분석 패널
+  // ============================================================
+  Widget _buildPingBreakdown(RobotData data) {
+    Widget seg(String label, double ms) {
+      final color = ms < 0 ? Colors.grey : _latencyColor(ms);
+      final val   = ms < 0 ? '—' : '${ms.toInt()}ms';
+      return Column(mainAxisSize: MainAxisSize.min, children: [
+        Text(label, style: TextStyle(fontSize: 10, color: Colors.grey.shade500)),
+        const SizedBox(height: 3),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.1),
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: color.withOpacity(0.4)),
+          ),
+          child: Text(val,
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: color)),
+        ),
+      ]);
+    }
+    Widget arrow() => Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Icon(Icons.arrow_forward, size: 12, color: Colors.grey.shade400),
+    );
+
+    final wifiHop = (data.pingGwMs >= 0 && data.pingMoxaMs >= 0)
+        ? data.pingGwMs - data.pingMoxaMs : -1.0;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          seg('로봇 PC', 0),
+          arrow(),
+          seg('MOXA LAN', data.pingMoxaMs),
+          Column(mainAxisSize: MainAxisSize.min, children: [
+            arrow(),
+            if (wifiHop >= 0)
+              Text('WiFi +${wifiHop.toInt()}ms',
+                  style: TextStyle(fontSize: 9, color: _latencyColor(wifiHop))),
+          ]),
+          seg('AP GW', data.pingGwMs),
+          arrow(),
+          seg('서버', data.currentPing),
+          const SizedBox(width: 12),
+          Column(mainAxisSize: MainAxisSize.min, children: [
+            Text('경로 진단', style: TextStyle(fontSize: 10, color: Colors.grey.shade500)),
+            const SizedBox(height: 3),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: _latencySrcColor(data.latencySrc).withOpacity(0.1),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: _latencySrcColor(data.latencySrc).withOpacity(0.4)),
+              ),
+              child: Text(
+                data.latencySrc.isEmpty ? '—' : data.latencySrc,
+                style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: _latencySrcColor(data.latencySrc)),
+              ),
+            ),
+          ]),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLatencySrcBadge(String src) {
+    if (src.isEmpty) return _tdDash();
+    final color = _latencySrcColor(src);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withOpacity(0.4)),
+      ),
+      child: Text(src,
+          style: TextStyle(
+              fontSize: 9, color: color, fontWeight: FontWeight.bold),
+          overflow: TextOverflow.ellipsis),
+    );
+  }
+
+  Color _latencyColor(double ms) {
+    if (ms < 0)   return Colors.grey;
+    if (ms < 10)  return Colors.green;
+    if (ms < 50)  return Colors.amber.shade700;
+    if (ms < 100) return Colors.orange;
+    return Colors.red;
+  }
+
+  Color _latencySrcColor(String src) {
+    switch (src) {
+      case 'NORMAL':        return Colors.green;
+      case 'WIFI_POOR':     return Colors.orange;
+      case 'WIFI_DOWN':     return Colors.red;
+      case 'MOXA_LAN_DOWN': return Colors.red;
+      case 'SERVER_DOWN':   return Colors.deepOrange;
+      case 'NETWORK_ISSUE': return Colors.amber.shade700;
+      default:              return Colors.grey;
+    }
   }
 
   // ============================================================
@@ -1374,35 +1490,101 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
   //       각 로봇의 이름 + 진단 상태를 한 줄로 표시
   // ============================================================
   Widget _buildSummaryBar() {
+    final normalCount = robots.values.where((d) {
+      final diag = DiagnosisEngine.analyze(d, allRobots: robots);
+      final stale = d.lastReceived != null &&
+          DateTime.now().difference(d.lastReceived!).inSeconds > _dataTimeoutSec;
+      return diag.layer == FaultLayer.normal && !stale;
+    }).length;
+    final alertCount = robots.length - normalCount;
+
     return Container(
-      color: Colors.indigo.shade800,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          children: [
-            const Text('전체 현황: ', style: TextStyle(color: Colors.white70, fontSize: 12)),
-            const SizedBox(width: 8),
-            ...robots.values.map((data) {
+      color: Colors.indigo.shade900,
+      padding: const EdgeInsets.fromLTRB(16, 6, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 요약 헤더
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(children: [
+              Text('전체 ${robots.length}대',
+                  style: const TextStyle(color: Colors.white54, fontSize: 11, fontWeight: FontWeight.bold)),
+              const SizedBox(width: 10),
+              if (normalCount > 0)
+                _summaryCountChip('정상 $normalCount', Colors.green),
+              const SizedBox(width: 6),
+              if (alertCount > 0)
+                _summaryCountChip('이상 $alertCount', Colors.orange),
+            ]),
+          ),
+          // 로봇 그리드
+          Wrap(
+            spacing: 5,
+            runSpacing: 5,
+            children: robots.values.map((data) {
               final diag = DiagnosisEngine.analyze(data, allRobots: robots);
               final isStale = data.lastReceived != null &&
                   DateTime.now().difference(data.lastReceived!).inSeconds > _dataTimeoutSec;
-              return Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: Chip(
-                  avatar: Icon(_diagIcon(diag.layer), size: 14, color: Colors.white),
-                  label: Text(
-                    '${data.id}  ${isStale ? "⚠" : ""}  RSSI ${data.currentRssi}dBm',
-                    style: const TextStyle(color: Colors.white, fontSize: 11),
+              final isNormal = diag.layer == FaultLayer.normal && !isStale;
+              final shortId = data.id.replaceAll('sebang', '');
+              final rssiText = data.rssiAvailable ? '${data.currentRssi}' : 'N/A';
+              final bgColor = isStale
+                  ? Colors.orange.shade700
+                  : isNormal
+                      ? Colors.green.shade700.withOpacity(0.6)
+                      : diag.badgeColor.withOpacity(0.9);
+              return GestureDetector(
+                onTap: () => setState(() {
+                  _tableView = true;
+                  _expandedTableRow = (_expandedTableRow == data.id) ? null : data.id;
+                }),
+                child: Container(
+                  width: 52,
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: bgColor,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: _expandedTableRow == data.id
+                          ? Colors.white
+                          : Colors.white.withOpacity(0.15),
+                      width: _expandedTableRow == data.id ? 2 : 1,
+                    ),
                   ),
-                  backgroundColor: diag.badgeColor.withOpacity(0.85),
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(shortId,
+                          style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold)),
+                      Text(rssiText,
+                          style: TextStyle(
+                              color: Colors.white.withOpacity(0.85),
+                              fontSize: 9)),
+                    ],
+                  ),
                 ),
               );
-            }),
-          ],
-        ),
+            }).toList(),
+          ),
+        ],
       ),
+    );
+  }
+
+  Widget _summaryCountChip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.2),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withOpacity(0.5)),
+      ),
+      child: Text(label,
+          style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.bold)),
     );
   }
 
@@ -1853,9 +2035,29 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
           TextButton.icon(
             icon: const Icon(Icons.copy),
             label: const Text('클립보드 복사'),
-            onPressed: () {
-              Clipboard.setData(ClipboardData(text: report));
-              ScaffoldMessenger.of(context).showSnackBar(
+            onPressed: () async {
+              bool copied = false;
+              try {
+                await Clipboard.setData(ClipboardData(text: report));
+                copied = true;
+              } catch (_) {}
+              if (!copied) {
+                // HTTP 환경에서 clipboard API 실패 시 선택 가능한 텍스트 다이얼로그 표시
+                showDialog(
+                  context: ctx,
+                  builder: (_) => AlertDialog(
+                    title: const Text('텍스트 선택 후 복사'),
+                    content: SizedBox(
+                      width: 640, height: 400,
+                      child: SelectableText(report,
+                          style: const TextStyle(fontFamily: 'Consolas', fontSize: 12, height: 1.6)),
+                    ),
+                    actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('닫기'))],
+                  ),
+                );
+                return;
+              }
+              ScaffoldMessenger.of(ctx).showSnackBar(
                 const SnackBar(content: Text('보고서가 클립보드에 복사되었습니다.')));
             },
           ),

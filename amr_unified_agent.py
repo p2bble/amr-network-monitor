@@ -12,6 +12,7 @@ from datetime import datetime
 # ================= [1] 인프라 및 통신 설정 =================
 SERVER_IP   = "192.168.145.5"
 MOXA_IP     = "192.167.140.1"
+AP_GW       = "192.168.145.254"     # AP 측 게이트웨이 (WiFi 구간 진단용)
 ROBOT_ID    = "sebang001"            # 로봇별 배포 시 변경
 
 WLAN_IFACE  = "wlxb0386cf45145"     # 로봇별 배포 시 변경
@@ -30,13 +31,17 @@ RSSI_WEAK_THRESHOLD  = -75   # dBm 이하 → 약함
 RSSI_BAD_THRESHOLD   = -85   # dBm 이하 → 불량
 PING_WARN_THRESHOLD  = 100   # ms 이상 → 지연 경고
 PING_CRIT_THRESHOLD  = 500   # ms 이상 → 심각 지연
+STICKY_CLIENT_SEC    = 30    # RSSI 약한데 로밍 없이 이 시간 경과 → Sticky 경고
+WIFI_POOR_THRESHOLD  = 100   # WiFi 구간(ping_gw - ping_moxa) ms 이상 → 불량 판정
 # ============================================================
 
-latest_log_msg   = "None"
-active_mode      = "UNKNOWN"
-_prev_tx_packets = 0
-_prev_tx_retries = 0
-_moxa_data       = {}   # 서버 MOXA 폴러에서 수신한 최신 MOXA 데이터
+latest_log_msg     = "None"
+active_mode        = "UNKNOWN"
+_prev_tx_packets   = 0
+_prev_tx_retries   = 0
+_moxa_data         = {}   # 서버 MOXA 폴러에서 수신한 최신 MOXA 데이터
+_bssid_stuck_since = None # Sticky client 판단용 타임스탬프
+_sticky_alerted    = False
 
 # ── 파일 로깅 ───────────────────────────────────────────────
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -61,10 +66,11 @@ def detect_environment():
     # 부팅 시 MOXA ping 실패가 NATIVE 폴백을 유발하는 문제 수정.
     return "MOXA" if MOXA_IP else "NATIVE"
 
-def ping_server():
+def ping_target(ip, timeout=2):
+    """단일 IP에 ping, 응답 시간(ms) 반환. 실패 시 -1.0"""
     try:
         out = subprocess.check_output(
-            ['ping', '-c', '1', '-W', '2', SERVER_IP],
+            ['ping', '-c', '1', '-W', str(timeout), ip],
             stderr=subprocess.STDOUT, universal_newlines=True
         )
         m = re.search(r'time=([\d\.]+)\s*ms', out)
@@ -73,6 +79,38 @@ def ping_server():
     except subprocess.CalledProcessError:
         pass
     return -1.0
+
+def ping_server():
+    return ping_target(SERVER_IP)
+
+def ping_multi(targets, timeout=2):
+    """여러 타겟에 동시 ping. {ip: ms} 반환 (-1.0 = 실패)"""
+    results = {}
+    def _p(ip):
+        results[ip] = ping_target(ip, timeout)
+    threads = [threading.Thread(target=_p, args=(ip,)) for ip in targets]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    return results
+
+def diagnose_latency(ping_moxa, ping_gw, ping_srv):
+    """단계별 ping으로 지연 원인 추론.
+    ping_moxa: MOXA LAN IP (192.167.140.1)  ← LAN 케이블 품질
+    ping_gw  : AP 게이트웨이                 ← WiFi 구간 품질
+    ping_srv : 서버                          ← 전체 경로
+    """
+    if ping_moxa < 0:
+        return "MOXA_LAN_DOWN"    # LAN 케이블 또는 MOXA 장치 문제
+    if ping_gw < 0:
+        return "WIFI_DOWN"        # WiFi 연결 끊김 또는 AP 불응
+    wifi_ms = ping_gw - ping_moxa
+    if wifi_ms > WIFI_POOR_THRESHOLD:
+        return "WIFI_POOR"        # RF 불량 또는 AP 과부하
+    if ping_srv < 0:
+        return "SERVER_DOWN"      # AP→서버 구간 단절
+    if (ping_srv - ping_gw) > WIFI_POOR_THRESHOLD:
+        return "NETWORK_ISSUE"    # AP→서버 구간 지연
+    return "NORMAL"
 
 # ── IP 주소 조회 ─────────────────────────────────────────────
 def get_lan_ip():
@@ -258,7 +296,7 @@ def connect_mqtt():
 
 # ── 메인 실행 루프 ───────────────────────────────────────────
 def main():
-    global active_mode, latest_log_msg
+    global active_mode, latest_log_msg, _bssid_stuck_since, _sticky_alerted
 
     active_mode = detect_environment()
     log_event("START", f"에이전트 시작 — 모드: {active_mode}")
@@ -283,7 +321,18 @@ def main():
     rssi_weak_count = 0  # RSSI_WEAK_THRESHOLD 이하 연속 횟수
 
     while True:
-        ping_latency = ping_server()
+        # ── 구간별 ping (MOXA 모드: 3타겟 병렬, NATIVE: 서버만) ──
+        if active_mode == "MOXA":
+            _pings       = ping_multi([MOXA_IP, AP_GW, SERVER_IP])
+            ping_moxa_ms = _pings[MOXA_IP]
+            ping_gw_ms   = _pings[AP_GW]
+            ping_latency = _pings[SERVER_IP]
+            latency_src  = diagnose_latency(ping_moxa_ms, ping_gw_ms, ping_latency)
+        else:
+            ping_moxa_ms = -1.0
+            ping_gw_ms   = -1.0
+            ping_latency = ping_server()
+            latency_src  = "N/A"
 
         if active_mode == "MOXA":
             iface_name                              = LAN_IFACE
@@ -326,8 +375,27 @@ def main():
 
         # ── 이벤트 감지: 로밍 (BSSID 변경) ────────────────
         if prev_bssid and prev_bssid != bssid and bssid not in ("Disconnected", "Error", "Unknown"):
-            log_event("ROAM", f"로밍 발생: {prev_bssid} → {bssid} (Ch: {channel})")
+            if active_mode == "MOXA":
+                gw_str  = f"{ping_gw_ms:.0f}ms" if ping_gw_ms >= 0 else "N/A"
+                log_event("ROAM", f"로밍 발생: {prev_bssid} → {bssid} (Ch: {channel}, RSSI: {rssi}, ping_gw: {gw_str})")
+            else:
+                log_event("ROAM", f"로밍 발생: {prev_bssid} → {bssid} (Ch: {channel})")
+            _bssid_stuck_since = None
+            _sticky_alerted    = False
         prev_bssid = bssid
+
+        # ── 이벤트 감지: Sticky Client (MOXA 모드) ─────────
+        if active_mode == "MOXA" and rssi_int is not None and rssi_int < RSSI_WEAK_THRESHOLD:
+            if bssid not in ("Unknown", "Error", "Disconnected"):
+                if _bssid_stuck_since is None:
+                    _bssid_stuck_since = time.time()
+                stuck_sec = time.time() - _bssid_stuck_since
+                if stuck_sec >= STICKY_CLIENT_SEC and not _sticky_alerted:
+                    log_event("WARN", f"STICKY CLIENT: RSSI={rssi_int}dBm, {int(stuck_sec)}초간 로밍 없음 (AP: {bssid})")
+                    _sticky_alerted = True
+        else:
+            _bssid_stuck_since = None
+            _sticky_alerted    = False
 
         # ── 이벤트 감지: RSSI 임계값 교차 (debounce: 3회 연속) ────
         if rssi_int is not None:
@@ -382,7 +450,9 @@ def main():
             "pc_ip":           get_lan_ip(),
             "freq_mhz":        freq_mhz,
             "band":            band,
-            **({"snr": snr, "noise": noise, "rate_mbps": rate_mbps}
+            **({"snr": snr, "noise": noise, "rate_mbps": rate_mbps,
+                "ping_moxa_ms": ping_moxa_ms, "ping_gw_ms": ping_gw_ms,
+                "latency_src":  latency_src}
                if active_mode == "MOXA" else {}),
             **stats,
         }
