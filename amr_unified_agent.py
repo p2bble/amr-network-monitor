@@ -6,13 +6,13 @@ import socket
 import threading
 import re
 import os
+import collections
 import paho.mqtt.client as mqtt
 from datetime import datetime
 
 # ================= [1] 인프라 및 통신 설정 =================
 SERVER_IP   = "192.168.145.5"
 MOXA_IP     = "192.167.140.1"
-AP_GW       = "192.168.145.254"     # AP 측 게이트웨이 (WiFi 구간 진단용)
 ROBOT_ID    = "sebang001"            # 로봇별 배포 시 변경
 
 WLAN_IFACE  = "wlxb0386cf45145"     # 로봇별 배포 시 변경
@@ -26,13 +26,14 @@ MOXA_TOPIC  = f"infra_test/moxa/{ROBOT_ID}"
 LOG_DIR     = os.path.expanduser("~/wifi_agent/logs")
 LOG_FILE    = os.path.join(LOG_DIR, f"{ROBOT_ID}_events.log")
 
-# 임계값 기준
-RSSI_WEAK_THRESHOLD  = -75   # dBm 이하 → 약함
-RSSI_BAD_THRESHOLD   = -85   # dBm 이하 → 불량
-PING_WARN_THRESHOLD  = 100   # ms 이상 → 지연 경고
-PING_CRIT_THRESHOLD  = 500   # ms 이상 → 심각 지연
-STICKY_CLIENT_SEC    = 30    # RSSI 약한데 로밍 없이 이 시간 경과 → Sticky 경고
-WIFI_POOR_THRESHOLD  = 100   # WiFi 구간(ping_gw - ping_moxa) ms 이상 → 불량 판정
+# 임계값 (이벤트 로그 기록용만 유지, 경보 기준은 서버 진단 서비스에서 판단)
+RSSI_WEAK_THRESHOLD  = -75   # dBm: 파일 로그 기록 기준
+RSSI_BAD_THRESHOLD   = -80   # dBm: 파일 로그 기록 기준
+STICKY_CLIENT_SEC    = 60    # 초: RSSI 약한데 로밍 없으면 파일 로그 기록
+
+# ── 슬라이딩 윈도우 (60초 rolling 배경 지표용) ────────────────
+LOOP_INTERVAL_SEC = 5
+WINDOW_SIZE       = 12   # 5초 × 12 = 60초
 # ============================================================
 
 latest_log_msg     = "None"
@@ -42,6 +43,26 @@ _prev_tx_retries   = 0
 _moxa_data         = {}   # 서버 MOXA 폴러에서 수신한 최신 MOXA 데이터
 _bssid_stuck_since = None # Sticky client 판단용 타임스탬프
 _sticky_alerted    = False
+
+# ── 슬라이딩 윈도우 (60초 rolling — 배경 지표, 서버 진단용) ──
+_ping_srv_window = collections.deque(maxlen=WINDOW_SIZE)
+_roam_timestamps = collections.deque()   # 로밍 발생 시각 (10분 윈도우)
+
+def _window_stats(window):
+    """슬라이딩 윈도우 → (avg_ms, loss_pct). -1은 loss 처리."""
+    if not window:
+        return -1.0, 0.0
+    valid    = [p for p in window if p >= 0]
+    n_total  = len(window)
+    loss_pct = round((n_total - len(valid)) / n_total * 100, 1)
+    avg      = round(sum(valid) / len(valid), 1) if valid else -1.0
+    return avg, loss_pct
+
+def _roam_count_10min():
+    now = time.time()
+    while _roam_timestamps and now - _roam_timestamps[0] > 600:
+        _roam_timestamps.popleft()
+    return len(_roam_timestamps)
 
 # ── 파일 로깅 ───────────────────────────────────────────────
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -66,7 +87,7 @@ def detect_environment():
     # 부팅 시 MOXA ping 실패가 NATIVE 폴백을 유발하는 문제 수정.
     return "MOXA" if MOXA_IP else "NATIVE"
 
-def ping_target(ip, timeout=2):
+def ping_target(ip, timeout=1):
     """단일 IP에 ping, 응답 시간(ms) 반환. 실패 시 -1.0"""
     try:
         out = subprocess.check_output(
@@ -83,47 +104,27 @@ def ping_target(ip, timeout=2):
 def ping_server():
     return ping_target(SERVER_IP)
 
-def ping_multi(targets, timeout=2):
-    """여러 타겟에 동시 ping. {ip: ms} 반환 (-1.0 = 실패)"""
-    results = {}
-    def _p(ip):
-        results[ip] = ping_target(ip, timeout)
-    threads = [threading.Thread(target=_p, args=(ip,)) for ip in targets]
-    for t in threads: t.start()
-    for t in threads: t.join()
-    return results
 
-def diagnose_latency(ping_moxa, ping_gw, ping_srv):
-    """단계별 ping으로 지연 원인 추론.
-    ping_moxa: MOXA LAN IP (192.167.140.1)  ← LAN 케이블 품질
-    ping_gw  : AP 게이트웨이                 ← WiFi 구간 품질
-    ping_srv : 서버                          ← 전체 경로
-    """
-    if ping_moxa < 0:
-        return "MOXA_LAN_DOWN"    # LAN 케이블 또는 MOXA 장치 문제
-    if ping_gw < 0:
-        return "WIFI_DOWN"        # WiFi 연결 끊김 또는 AP 불응
-    wifi_ms = ping_gw - ping_moxa
-    if wifi_ms > WIFI_POOR_THRESHOLD:
-        return "WIFI_POOR"        # RF 불량 또는 AP 과부하
-    if ping_srv < 0:
-        return "SERVER_DOWN"      # AP→서버 구간 단절
-    if (ping_srv - ping_gw) > WIFI_POOR_THRESHOLD:
-        return "NETWORK_ISSUE"    # AP→서버 구간 지연
-    return "NORMAL"
+# ── IP 주소 조회 (5분 캐시) ─────────────────────────────────
+_lan_ip_cache = ("", 0.0)
 
-# ── IP 주소 조회 ─────────────────────────────────────────────
 def get_lan_ip():
-    """LAN 인터페이스의 IPv4 주소를 반환합니다."""
+    """LAN 인터페이스의 IPv4 주소를 반환합니다 (5분 캐시)."""
+    global _lan_ip_cache
+    ip, ts = _lan_ip_cache
+    if ip and time.time() - ts < 300:
+        return ip
     try:
         out = subprocess.check_output(
             ['ip', 'addr', 'show', LAN_IFACE],
             stderr=subprocess.STDOUT, universal_newlines=True
         )
         m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', out)
-        return m.group(1) if m else ""
+        ip = m.group(1) if m else ""
     except Exception:
-        return ""
+        ip = ""
+    _lan_ip_cache = (ip, time.time())
+    return ip
 
 # ── MOXA 모드 ────────────────────────────────────────────────
 def get_moxa_data():
@@ -309,10 +310,10 @@ def main():
         threading.Thread(target=native_wifi_log_listener, daemon=True).start()
 
     # 이전 상태 추적 (임계값 교차 이벤트 감지용)
-    prev_status   = "NORMAL"
-    prev_bssid    = ""
-    prev_rssi_int = 0
-    prev_ping     = 0.0
+    prev_status     = "NORMAL"
+    prev_bssid      = ""
+    prev_rssi_int   = 0
+    prev_ping       = 0.0
     reconnect_count = 0
 
     # RSSI debounce 카운터 (3회 연속 시에만 이벤트 발생, 순간 노이즈 오탐 방지)
@@ -321,27 +322,22 @@ def main():
     rssi_weak_count = 0  # RSSI_WEAK_THRESHOLD 이하 연속 횟수
 
     while True:
-        # ── 구간별 ping (MOXA 모드: 3타겟 병렬, NATIVE: 서버만) ──
-        if active_mode == "MOXA":
-            _pings       = ping_multi([MOXA_IP, AP_GW, SERVER_IP])
-            ping_moxa_ms = _pings[MOXA_IP]
-            ping_gw_ms   = _pings[AP_GW]
-            ping_latency = _pings[SERVER_IP]
-            latency_src  = diagnose_latency(ping_moxa_ms, ping_gw_ms, ping_latency)
-        else:
-            ping_moxa_ms = -1.0
-            ping_gw_ms   = -1.0
-            ping_latency = ping_server()
-            latency_src  = "N/A"
+        # ── 서버 ping (단일 타겟) ────────────────────────────────
+        ping_latency = ping_server()
+
+        # ── 슬라이딩 윈도우 업데이트 ───────────────────────────
+        _ping_srv_window.append(ping_latency)
+        ping_avg_60s, ping_loss_pct = _window_stats(_ping_srv_window)
+        roam_count_10min            = _roam_count_10min()
 
         if active_mode == "MOXA":
-            iface_name                              = LAN_IFACE
-            iface_type                              = "External (Moxa)"
+            iface_name  = LAN_IFACE
+            iface_type  = "External (Moxa)"
             bssid, rssi, ssid, channel, snr, noise, rate_mbps = get_moxa_data()
-            freq_mhz             = 0
-            band                 = "Unknown"
-            stats                = {'tx_retry_rate': -1.0, 'tx_failed': -1,
-                                    'rx_bitrate':    -1.0, 'tx_bitrate': -1.0}
+            freq_mhz    = 0
+            band        = "Unknown"
+            stats       = {'tx_retry_rate': -1.0, 'tx_failed': -1,
+                           'rx_bitrate':    -1.0, 'tx_bitrate': -1.0}
         else:
             iface_name                            = WLAN_IFACE
             iface_type                            = "Internal (Native)"
@@ -375,11 +371,8 @@ def main():
 
         # ── 이벤트 감지: 로밍 (BSSID 변경) ────────────────
         if prev_bssid and prev_bssid != bssid and bssid not in ("Disconnected", "Error", "Unknown"):
-            if active_mode == "MOXA":
-                gw_str  = f"{ping_gw_ms:.0f}ms" if ping_gw_ms >= 0 else "N/A"
-                log_event("ROAM", f"로밍 발생: {prev_bssid} → {bssid} (Ch: {channel}, RSSI: {rssi}, ping_gw: {gw_str})")
-            else:
-                log_event("ROAM", f"로밍 발생: {prev_bssid} → {bssid} (Ch: {channel})")
+            log_event("ROAM", f"로밍 발생: {prev_bssid} → {bssid} (Ch: {channel}, RSSI: {rssi})")
+            _roam_timestamps.append(time.time())  # 10분 윈도우용 타임스탬프
             _bssid_stuck_since = None
             _sticky_alerted    = False
         prev_bssid = bssid
@@ -420,39 +413,32 @@ def main():
                     rssi_weak_count = 0
             prev_rssi_int = rssi_int
 
-        # ── 이벤트 감지: Ping 임계값 교차 ─────────────────
-        if ping_latency >= 0 and prev_ping >= 0:
-            if prev_ping < PING_WARN_THRESHOLD and ping_latency >= PING_WARN_THRESHOLD:
-                log_event("WARN", f"Ping 지연 발생: {prev_ping:.0f}ms → {ping_latency:.0f}ms")
-            elif prev_ping >= PING_WARN_THRESHOLD and ping_latency < PING_WARN_THRESHOLD:
-                log_event("INFO", f"Ping 정상화: {prev_ping:.0f}ms → {ping_latency:.0f}ms")
-            if prev_ping < PING_CRIT_THRESHOLD and ping_latency >= PING_CRIT_THRESHOLD:
-                log_event("CRIT", f"Ping 심각 지연: {ping_latency:.0f}ms")
         if ping_latency >= 0:
             prev_ping = ping_latency
 
         # ── Payload 구성 ────────────────────────────────────
         payload = {
-            "robot_id":        ROBOT_ID,
-            "timestamp":       ts,
-            "active_mode":     active_mode,
-            "interface_name":  iface_name,
-            "interface_type":  iface_type,
-            "ping_ms":         ping_latency,
-            "bssid":           bssid,
-            "ssid":            ssid,
-            "channel":         channel,
-            "rssi":            rssi,
-            "status":          status,
-            "latest_log":      latest_log_msg,
-            "reconnect_count": reconnect_count,
-            "srv_ip":          SERVER_IP,
-            "pc_ip":           get_lan_ip(),
-            "freq_mhz":        freq_mhz,
-            "band":            band,
-            **({"snr": snr, "noise": noise, "rate_mbps": rate_mbps,
-                "ping_moxa_ms": ping_moxa_ms, "ping_gw_ms": ping_gw_ms,
-                "latency_src":  latency_src}
+            "robot_id":         ROBOT_ID,
+            "timestamp":        ts,
+            "active_mode":      active_mode,
+            "interface_name":   iface_name,
+            "interface_type":   iface_type,
+            "ping_ms":          ping_latency,       # 서버 ping 순간값 (진단 참고용)
+            "ping_avg_60s":     ping_avg_60s,       # 60초 평균 ping
+            "ping_loss_pct":    ping_loss_pct,      # 60초 패킷 손실률 (%)
+            "bssid":            bssid,
+            "ssid":             ssid,
+            "channel":          channel,
+            "rssi":             rssi,
+            "status":           status,
+            "latest_log":       latest_log_msg,
+            "reconnect_count":  reconnect_count,    # MQTT 재연결 누적 (핵심 지표)
+            "roam_count_10min": roam_count_10min,   # 10분 내 로밍 횟수
+            "srv_ip":           SERVER_IP,
+            "pc_ip":            get_lan_ip(),
+            "freq_mhz":         freq_mhz,
+            "band":             band,
+            **({"snr": snr, "noise": noise, "rate_mbps": rate_mbps}
                if active_mode == "MOXA" else {}),
             **stats,
         }
@@ -466,7 +452,7 @@ def main():
             reconnect_count += 1
 
         latest_log_msg = "None"  # 한 번 전송 후 초기화
-        time.sleep(1)
+        time.sleep(LOOP_INTERVAL_SEC)  # 5초 (기존 1초 → 순간값 노이즈 제거)
 
 if __name__ == "__main__":
     main()

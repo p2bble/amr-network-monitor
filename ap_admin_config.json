@@ -1,0 +1,26 @@
+{
+  "_comment": "AP 관리자 설정 파일. infra_monitor.py 에서 60초마다 자동 리로드됨. 서비스 재시작 불필요.",
+  "_wifi_status_values": {
+    "ACTIVE":   "WiFi 정상 운영 중",
+    "SHUTDOWN": "관리자가 radio interface를 shutdown한 상태 (ping은 UP, WiFi OFF)",
+    "DISABLED": "해당 AP는 WiFi 기능 미운영 구역 (영구적 비활성)"
+  },
+
+  "ap_wifi_status": {
+    "AP-01":  "ACTIVE",
+    "AP-02":  "ACTIVE",
+    "AP-03":  "ACTIVE",
+    "AP-04":  "ACTIVE",
+    "AP-05":  "DISABLED",
+    "AP-06":  "ACTIVE",
+    "AP-07":  "ACTIVE",
+    "AP-08":  "ACTIVE",
+    "AP-09":  "ACTIVE",
+    "AP-10":  "DISABLED",
+    "AP-11":  "ACTIVE",
+    "AP-12":  "ACTIVE",
+    "AP-13":  "ACTIVE",
+    "AP-14":  "SHUTDOWN",
+    "AP-15":  "SHUTDOWN"
+  }
+}

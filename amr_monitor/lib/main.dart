@@ -51,13 +51,15 @@ class DiagnosisResult {
 // [B] 자동 장애 원인 분류 엔진
 // ============================================================
 class DiagnosisEngine {
-  static const int    _rssiWeak      = -75;
-  static const int    _rssiCritical  = -85;
-  static const int    _pingHighMs    = 100;
-  static const int    _pingCritMs    = 500;
-  static const int    _agentTimeout  = 30;
-  static const int    _roamingFreq   = 3;
-  static const double _packetLossWarn = 5.0;
+  // ── 임계값 (산업 표준 기반: Cisco/Aruba 5GHz 창고 환경 권고치) ──
+  static const int    _rssiWeak      = -75;   // dBm: 경계 구간 (60초 지속 시)
+  static const int    _rssiCritical  = -80;   // dBm: 실질 불통 구간 (기존 -85 → -80, 5GHz 실사용 하한)
+  static const int    _pingHighMs    = 80;    // ms: 60초 평균 경고 (기존 100 → 80, AMR 제어 권고치)
+  static const int    _pingCritMs    = 200;   // ms: 60초 평균 심각 (기존 500 → 200, 순간값 스파이크 아님)
+  static const int    _agentTimeout  = 30;    // 초: 에이전트 무응답
+  static const int    _roamingFreq   = 5;     // 회: 10분 내 로밍 횟수 경고 (기존 3회/5분)
+  static const double _packetLossWarn = 5.0;  // %: 60초 손실률 경고
+  static const double _packetLossCrit = 15.0; // %: 60초 손실률 심각 (신규)
   static const double _cpuHigh       = 85.0;
 
   // 같은 BSSID(AP)의 다른 로봇들과 Retry율을 비교해 국소 간섭 여부를 판별합니다.
@@ -128,11 +130,23 @@ class DiagnosisEngine {
         badgeColor: Colors.red,
       );
     }
-    if (d.packetLoss >= 0 && d.packetLoss > _packetLossWarn) {
+    // 패킷 손실: 60초 윈도우 우선, 없으면 레거시 packetLoss 사용
+    final effectiveLoss = d.pingLossPct > 0 ? d.pingLossPct
+        : (d.packetLoss >= 0 ? d.packetLoss : 0.0);
+    if (effectiveLoss > _packetLossCrit) {
       return DiagnosisResult(
         layer: FaultLayer.network,
-        summary: '패킷 손실 ${d.packetLoss.toInt()}%',
-        detail: '패킷 손실 ${d.packetLoss.toStringAsFixed(1)}% — 무선 간섭 또는 채널 혼잡',
+        summary: '패킷 손실 심각 ${effectiveLoss.toInt()}% (60s)',
+        detail: '60초 평균 패킷 손실 ${effectiveLoss.toStringAsFixed(1)}% — 연속 연결 불안정',
+        action: '무선 채널 점검\n→ 인접 AP 채널 분리 (5GHz 권장)\n→ MOXA 안테나 상태 확인',
+        badgeColor: Colors.red,
+      );
+    }
+    if (effectiveLoss > _packetLossWarn) {
+      return DiagnosisResult(
+        layer: FaultLayer.network,
+        summary: '패킷 손실 ${effectiveLoss.toInt()}% (60s)',
+        detail: '60초 평균 패킷 손실 ${effectiveLoss.toStringAsFixed(1)}% — 간헐적 연결 불안정',
         action: '무선 채널 점검\n→ 인접 AP 채널 분리 (5GHz 권장)\n→ MOXA Tx Power 조정',
         badgeColor: Colors.orange,
       );
@@ -232,30 +246,41 @@ class DiagnosisEngine {
         badgeColor: Colors.orange,
       );
     }
-    if (d.recentRoamingCount >= _roamingFreq) {
+    // 로밍 빈도: 에이전트 윈도우 값 우선, 없으면 대시보드 자체 카운팅 사용
+    final effectiveRoamCount = d.roamCount10min > 0 ? d.roamCount10min : d.recentRoamingCount;
+    final roamWindow = d.roamCount10min > 0 ? '10분' : '5분';
+    if (effectiveRoamCount >= _roamingFreq) {
       return DiagnosisResult(
         layer: FaultLayer.ap,
-        summary: '잦은 로밍 (${d.recentRoamingCount}회/5분)',
-        detail: '최근 5분간 ${d.recentRoamingCount}회 로밍 — Sticky Client 또는 커버리지 경계',
-        action: 'MOXA 로밍 임계값 조정 (-70 dBm)\n→ 인접 AP 오버랩 구간 재설계',
+        summary: '잦은 로밍 (${effectiveRoamCount}회/$roamWindow)',
+        detail: '최근 $roamWindow간 ${effectiveRoamCount}회 로밍 — Sticky Client 또는 커버리지 경계\n'
+            '※ 로밍 자체는 정상이나 빈도가 높으면 경계 구간 체류 또는 AP 신호 불균형',
+        action: 'MOXA roamingThreshold5G 확인 (-75dBm 권장)\n'
+            '→ roamingDifference5G 8 이상 권장 (핑퐁 방지)\n'
+            '→ 해당 구역 AP 커버리지 및 출력 재점검',
         badgeColor: Colors.orange,
       );
     }
-    if (d.currentPing > _pingCritMs) {
+    // Ping: 60초 평균 우선 사용 (순간값 스파이크 오탐 방지)
+    final effectivePing = d.pingAvg60s > 0 ? d.pingAvg60s : d.currentPing;
+    final pingLabel = d.pingAvg60s > 0 ? '${effectivePing.toInt()}ms avg(60s)' : '${effectivePing.toInt()}ms';
+    if (effectivePing > _pingCritMs) {
       return DiagnosisResult(
         layer: FaultLayer.network,
-        summary: 'Ping 심각 지연 (${d.currentPing.toInt()}ms)',
-        detail: '핑 ${d.currentPing.toInt()}ms — 네트워크 과부하 또는 루프 의심',
-        action: '스위치 STP 루프 점검\n→ QoS 정책 적용 여부 확인',
+        summary: 'Ping 심각 지연 ($pingLabel)',
+        detail: '60초 평균 핑 ${effectivePing.toInt()}ms — 지속적 네트워크 불량\n'
+            '(로밍 중 순간 스파이크는 정상. 이 경고는 지속적 지연을 의미)',
+        action: '스위치 STP 루프 점검\n→ QoS 정책 적용 여부 확인\n→ 백본 스위치 포트 에러 카운터 확인',
         badgeColor: Colors.red,
       );
     }
-    if (d.currentPing > _pingHighMs) {
+    if (effectivePing > _pingHighMs) {
       return DiagnosisResult(
         layer: FaultLayer.network,
-        summary: 'Ping 지연 (${d.currentPing.toInt()}ms)',
-        detail: '핑 ${d.currentPing.toInt()}ms — 정상 범위 초과',
-        action: '네트워크 대역폭 및 채널 간섭 점검',
+        summary: 'Ping 지연 ($pingLabel)',
+        detail: '60초 평균 핑 ${effectivePing.toInt()}ms — 성능 저하 구간\n'
+            '(로밍 직후 1~2초 스파이크는 정상이며 이 경고 대상 아님)',
+        action: 'AP 채널 간섭 또는 로밍 빈도 확인\n→ 네트워크 대역폭 및 채널 점검',
         badgeColor: Colors.amber,
       );
     }
@@ -310,6 +335,18 @@ class RobotData {
   double txBitrate   = -1;
   int    freqMhz     = 0;
   String band        = "";
+
+  // ── 60초 슬라이딩 윈도우 지표 ──────────────────────────────
+  double pingAvg60s     = -1;
+  double pingLossPct    = 0;
+  int    roamCount10min = 0;
+  String latencySrc60s  = "";
+
+  // ── 서버 진단 결과 (amr_diagnostics v2) ─────────────────────
+  bool   diagConnected      = true;
+  int    diagDisconnect1h   = 0;    // 1시간 내 끊김 횟수
+  Map<String, dynamic>? diagLastDisconnect;       // 마지막 단절 이벤트
+  List<Map<String, dynamic>> diagHistory = [];    // 최근 5건 단절 이력
 
   // IP 정보 (계층 패널 하단에 표시)
   String gwIp   = "";  // AP 게이트웨이 IP
@@ -381,6 +418,11 @@ class RobotData {
     if (json['tx_bitrate']    != null) txBitrate   = (json['tx_bitrate']    as num).toDouble();
     if (json['freq_mhz']      != null) freqMhz     = (json['freq_mhz']      as num).toInt();
     if (json['band']          != null) band        = json['band'];
+    // 60초 윈도우 지표
+    if (json['ping_avg_60s']     != null) pingAvg60s    = (json['ping_avg_60s']     as num).toDouble();
+    if (json['ping_loss_pct']    != null) pingLossPct   = (json['ping_loss_pct']    as num).toDouble();
+    if (json['roam_count_10min'] != null) roamCount10min = (json['roam_count_10min'] as num).toInt();
+    if (json['latency_src_60s']  != null) latencySrc60s = json['latency_src_60s'].toString();
 
     final rssiRaw = json['rssi']?.toString().replaceAll('dBm', '').trim() ?? '';
     final rssiParsed = int.tryParse(rssiRaw);
@@ -456,6 +498,17 @@ class RobotData {
     rssiHistory.add(FlSpot(timeIndex, currentRssi.toDouble()));
     if (pingHistory.length > 60) { pingHistory.removeAt(0); rssiHistory.removeAt(0); }
     timeIndex++;
+  }
+
+  /// 서버 진단 서비스(amr_diagnostics v2)에서 받은 결과 업데이트
+  void updateDiagnosis(Map<String, dynamic> json) {
+    diagConnected    = json['connected']           as bool?  ?? true;
+    diagDisconnect1h = (json['disconnect_count_1h'] as num?  ?? 0).toInt();
+    diagLastDisconnect = json['last_disconnect'] as Map<String, dynamic>?;
+    final history = json['disconnect_history'] as List?;
+    if (history != null) {
+      diagHistory = history.cast<Map<String, dynamic>>();
+    }
   }
 
   void _addLog(String type, String message) {
@@ -572,20 +625,40 @@ class InfraDevice {
   String type = '';
   String ip = '';
   bool isUp = false;
-  bool wifiDisabled = false;
+  // wifiStatus: ACTIVE | SHUTDOWN | DISABLED | DOWN
+  // ACTIVE   = WiFi 정상 운영
+  // SHUTDOWN = 관리자 radio shutdown (ping OK, WiFi OFF)
+  // DISABLED = 해당 구역 WiFi 미운영 (영구 비활성)
+  // DOWN     = ping 실패 (전원/케이블/PoE 장애)
+  String wifiStatus = 'ACTIVE';
   double pingMs = -1;
   String timestamp = '';
   DateTime? lastReceived;
 
+  bool get isWifiActive   => wifiStatus == 'ACTIVE' && isUp;
+  bool get isShutdown     => wifiStatus == 'SHUTDOWN';
+  bool get isDisabled     => wifiStatus == 'DISABLED';
+  // 구버전 wifi_disabled 필드 하위 호환
+  bool get wifiDisabled   => isShutdown || isDisabled;
+
   void update(Map<String, dynamic> json) {
-    id            = json['device_id']     ?? id;
-    type          = json['device_type']   ?? type;
-    ip            = json['ip']            ?? ip;
-    isUp          = (json['status'] ?? 'DOWN') == 'UP';
-    wifiDisabled  = json['wifi_disabled'] ?? false;
-    pingMs        = ((json['ping_ms'] ?? -1) as num).toDouble();
-    timestamp     = json['timestamp']     ?? '';
-    lastReceived  = DateTime.now();
+    id        = json['device_id']   ?? id;
+    type      = json['device_type'] ?? type;
+    ip        = json['ip']          ?? ip;
+    isUp      = (json['status'] ?? 'DOWN') == 'UP';
+    pingMs    = ((json['ping_ms'] ?? -1) as num).toDouble();
+    timestamp = json['timestamp']   ?? '';
+    lastReceived = DateTime.now();
+
+    if (json.containsKey('wifi_status')) {
+      wifiStatus = json['wifi_status'] as String;
+    } else if (json.containsKey('wifi_disabled')) {
+      // 구버전 서버 호환
+      final disabled = json['wifi_disabled'] as bool? ?? false;
+      wifiStatus = disabled ? 'DISABLED' : (isUp ? 'ACTIVE' : 'DOWN');
+    } else {
+      wifiStatus = isUp ? 'ACTIVE' : 'DOWN';
+    }
   }
 }
 
@@ -689,12 +762,22 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
             setState(() {
               _lastDataTime = DateTime.now();
               if (topic == 'infra_test/diagnosis/summary') {
+                // v2 진단 서비스 summary
+                _diagOnline      = (json['connected']  as num? ?? 0).toInt();
+                _diagAlertCount  = (json['offline']    as num? ?? 0).toInt();
+                _diagNormalCount = (json['connected']  as num? ?? 0).toInt();
+                _diagOffline     = List<String>.from(
+                    (json['offline_robots'] as List? ?? [])
+                        .map((e) => e['id']?.toString() ?? ''));
                 _crossFaults     = List<Map<String, dynamic>>.from(
-                    json['cross_faults'] as List? ?? []);
-                _diagOnline      = (json['online']       as num? ?? 0).toInt();
-                _diagAlertCount  = (json['alert_count']  as num? ?? 0).toInt();
-                _diagNormalCount = (json['normal_count'] as num? ?? 0).toInt();
-                _diagOffline     = List<String>.from(json['offline'] as List? ?? []);
+                    json['freq_1h'] as List? ?? []);
+              } else if (topic.startsWith('infra_test/diagnosis/') &&
+                         topic != 'infra_test/diagnosis/summary') {
+                // 개별 로봇 진단 결과 (v2)
+                final rid = topic.split('/').last;
+                if (rid.isNotEmpty && robots.containsKey(rid)) {
+                  robots[rid]!.updateDiagnosis(json);
+                }
               } else if (topic.startsWith('infra_test/network_infra/')) {
                 final did = json['device_id'] as String? ?? '';
                 if (did.isNotEmpty) {
@@ -725,14 +808,14 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
     if (!_disposed) setState(() => isConnected = true);
     client.subscribe('infra_test/network_status/#',  MqttQos.atMostOnce);
     client.subscribe('infra_test/network_infra/#',   MqttQos.atMostOnce);
-    client.subscribe('infra_test/diagnosis/summary', MqttQos.atMostOnce);
+    client.subscribe('infra_test/diagnosis/#',       MqttQos.atMostOnce);
   }
   void _onDisconnected()    { if (!_disposed) setState(() => isConnected = false); }
   void _onAutoReconnected() {
     if (!_disposed) setState(() => isConnected = true);
     client.subscribe('infra_test/network_status/#',  MqttQos.atMostOnce);
     client.subscribe('infra_test/network_infra/#',   MqttQos.atMostOnce);
-    client.subscribe('infra_test/diagnosis/summary', MqttQos.atMostOnce);
+    client.subscribe('infra_test/diagnosis/#',       MqttQos.atMostOnce);
   }
 
   @override
@@ -934,11 +1017,15 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
     final switches = infraDevices.values.where((d) => d.type == 'SWITCH').toList()
         ..sort((a, b) => a.id.compareTo(b.id));
 
-    final upAp      = aps.where((d) => d.isUp && !d.wifiDisabled).length;
-    final disabledAp = aps.where((d) => d.wifiDisabled).length;
-    final upSw      = switches.where((d) => d.isUp).length;
-    final totalAp   = aps.length;
-    final totalSw   = switches.length;
+    final activeAp   = aps.where((d) => d.isWifiActive).length;
+    final shutdownAp = aps.where((d) => d.isShutdown).length;
+    final disabledAp = aps.where((d) => d.isDisabled).length;
+    final downAp     = aps.where((d) => !d.isUp).length;
+    final upSw       = switches.where((d) => d.isUp).length;
+    final totalAp    = aps.length;
+    final totalSw    = switches.length;
+    // 운영 대상 AP = ACTIVE + DOWN (SHUTDOWN/DISABLED 제외)
+    final operationalAp = aps.where((d) => !d.isShutdown && !d.isDisabled).length;
 
     return Container(
       color: Colors.blueGrey.shade900,
@@ -957,19 +1044,18 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
                     style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
                 const SizedBox(width: 16),
                 if (totalAp > 0) ...[
-                  _infraSummaryChip('AP', upAp, totalAp - disabledAp),
+                  _infraSummaryChip('AP', activeAp, operationalAp),
+                  if (shutdownAp > 0) ...[
+                    const SizedBox(width: 6),
+                    _infraStatusChip('관리비활성 $shutdownAp', Colors.orange.shade300),
+                  ],
                   if (disabledAp > 0) ...[
                     const SizedBox(width: 6),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: Colors.grey.withOpacity(0.2),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.grey),
-                      ),
-                      child: Text('WiFi-OFF $disabledAp',
-                          style: const TextStyle(color: Colors.grey, fontSize: 11, fontWeight: FontWeight.bold)),
-                    ),
+                    _infraStatusChip('미운영 $disabledAp', Colors.blueGrey),
+                  ],
+                  if (downAp > 0) ...[
+                    const SizedBox(width: 6),
+                    _infraStatusChip('장애 $downAp', Colors.red),
                   ],
                   const SizedBox(width: 8),
                 ],
@@ -1024,22 +1110,56 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
     );
   }
 
+  Widget _infraStatusChip(String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.6)),
+      ),
+      child: Text(text,
+          style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.bold)),
+    );
+  }
+
   Widget _infraDeviceBadge(InfraDevice d) {
     final stale = d.lastReceived != null &&
         DateTime.now().difference(d.lastReceived!).inSeconds > 60;
-    final color = stale
-        ? Colors.grey
-        : d.wifiDisabled
-            ? Colors.blueGrey.shade400
-            : (d.isUp ? Colors.green.shade400 : Colors.red.shade400);
+
+    // 색상 결정
+    Color color;
+    String subLabel;
+    String tooltipStatus;
+
+    if (stale) {
+      color = Colors.grey;
+      subLabel = 'No data';
+      tooltipStatus = 'No data';
+    } else if (!d.isUp) {
+      color = Colors.red.shade400;
+      subLabel = 'DOWN';
+      tooltipStatus = 'DOWN — 전원/케이블/PoE 장애 의심';
+    } else if (d.isShutdown) {
+      color = Colors.orange.shade300;
+      subLabel = '관리비활성';
+      tooltipStatus = 'ping OK / radio shutdown (관리자 비활성)';
+    } else if (d.isDisabled) {
+      color = Colors.blueGrey.shade400;
+      subLabel = '미운영';
+      tooltipStatus = 'ping OK / WiFi 미운영 구역';
+    } else {
+      // ACTIVE
+      final pingStr = d.pingMs >= 0 ? '${d.pingMs.toStringAsFixed(0)}ms' : '';
+      color = Colors.green.shade400;
+      subLabel = pingStr;
+      tooltipStatus = 'UP  $pingStr';
+    }
+
     final label = d.id.replaceFirst('SW-PoE-', 'PoE-').replaceFirst('SW-Main-', 'Main-');
-    final pingStr = d.isUp && d.pingMs >= 0 ? '${d.pingMs.toStringAsFixed(0)}ms' : '';
-    final statusStr = stale ? 'No data'
-        : d.wifiDisabled ? 'WiFi OFF (ping ${d.isUp ? "OK" : "NG"})'
-        : (d.isUp ? 'UP  $pingStr' : 'DOWN');
 
     return Tooltip(
-      message: '${d.id}  ${d.ip}\n$statusStr',
+      message: '${d.id}  ${d.ip}\n$tooltipStatus',
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         decoration: BoxDecoration(
@@ -1050,10 +1170,8 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           Text(label,
               style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.bold)),
-          if (d.wifiDisabled)
-            Text('WiFi OFF', style: TextStyle(color: color.withOpacity(0.8), fontSize: 9))
-          else if (pingStr.isNotEmpty)
-            Text(pingStr, style: TextStyle(color: color.withOpacity(0.8), fontSize: 9)),
+          if (subLabel.isNotEmpty)
+            Text(subLabel, style: TextStyle(color: color.withOpacity(0.85), fontSize: 9)),
         ]),
       ),
     );
@@ -1175,12 +1293,11 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
               // RSSI
               Expanded(flex: 2, child: _tdValue(
                   '${data.currentRssi}', 'dBm', _rssiColor(data.currentRssi))),
-              // 경로 (latency_src)
-              Expanded(flex: 2, child: _buildLatencySrcBadge(data.latencySrc)),
-              // Ping
-              Expanded(flex: 2, child: _tdValue(
-                  '${data.currentPing.toInt()}', 'ms',
-                  _pingColor(data.currentPing))),
+              // 경로 (60초 평균 기반 우선, 없으면 순간값)
+              Expanded(flex: 2, child: _buildLatencySrcBadge(
+                  data.latencySrc60s.isNotEmpty ? data.latencySrc60s : data.latencySrc)),
+              // Ping (60초 평균 우선)
+              Expanded(flex: 2, child: _buildPingCell(data)),
               // 채널
               Expanded(flex: 3, child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1245,11 +1362,9 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
           ),
         ]),
         const SizedBox(height: 8),
-        // Ping 3단계 경로 분석 (MOXA 모드)
-        if (data.pingMoxaMs >= 0 || data.pingGwMs >= 0) ...[
-          _buildPingBreakdown(data),
-          const SizedBox(height: 8),
-        ],
+        // ── 끊김 이력 패널 (핵심) ──────────────────────────────
+        _buildDisconnectHistory(data),
+        const SizedBox(height: 8),
         // 채널 품질 바
         if (data.txRetryRate >= 0) ...[
           _buildChannelQualityBar(data),
@@ -1313,6 +1428,127 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
 
   // ============================================================
   // [E-ping] Ping 3단계 경로 분석 패널
+  // ============================================================
+  // 끊김 이력 패널 — 서버 진단 서비스(amr_diagnostics v2)에서 수신
+  // ============================================================
+  Widget _buildDisconnectHistory(RobotData data) {
+    final hasHistory = data.diagHistory.isNotEmpty;
+    final count1h    = data.diagDisconnect1h;
+
+    // 원인별 색상
+    Color causeColor(String cause) {
+      switch (cause) {
+        case 'backbone':     return Colors.red;
+        case 'ap_failure':   return Colors.deepOrange;
+        case 'sticky_client':return Colors.orange;
+        case 'roaming':      return Colors.amber.shade700;
+        case 'device':       return Colors.purple.shade300;
+        default:             return Colors.grey;
+      }
+    }
+    String causeLabel(String cause) {
+      switch (cause) {
+        case 'backbone':     return '백본/서버';
+        case 'ap_failure':   return 'AP장애';
+        case 'sticky_client':return 'Sticky로밍';
+        case 'roaming':      return '로밍';
+        case 'device':       return '디바이스';
+        default:             return cause;
+      }
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey.shade50,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.blueGrey.shade200),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.history, size: 14, color: Colors.blueGrey),
+            const SizedBox(width: 6),
+            Text('끊김 이력',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold,
+                    color: Colors.blueGrey.shade700)),
+            const SizedBox(width: 10),
+            if (count1h > 0)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                decoration: BoxDecoration(
+                  color: count1h >= 5 ? Colors.red.shade100 : Colors.orange.shade100,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text('1시간 내 $count1h회',
+                    style: TextStyle(
+                        fontSize: 10, fontWeight: FontWeight.bold,
+                        color: count1h >= 5 ? Colors.red : Colors.orange.shade800)),
+              )
+            else
+              Text('최근 1시간 이상 없음',
+                  style: TextStyle(fontSize: 10, color: Colors.green.shade600)),
+          ]),
+          if (!hasHistory)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text('기록된 단절 이벤트 없음',
+                  style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+            )
+          else ...[
+            const SizedBox(height: 6),
+            ...data.diagHistory.map((ev) {
+              final cause   = ev['cause'] as String? ?? '';
+              final detail  = ev['detail'] as String? ?? '';
+              final action  = ev['action'] as String? ?? '';
+              final time    = ev['time'] as String? ?? '';
+              final dur     = (ev['duration_sec'] as num? ?? 0).toDouble();
+              final color   = causeColor(cause);
+              final label   = causeLabel(cause);
+              // 시간 표시: "HH:MM:SS" 형식에서 "HH:MM" 추출
+              final timeShort = time.length >= 5 ? time.substring(11, 16) : time;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: color.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(3),
+                      border: Border.all(color: color.withOpacity(0.5)),
+                    ),
+                    child: Text(label,
+                        style: TextStyle(fontSize: 9, color: color, fontWeight: FontWeight.bold)),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(timeShort,
+                      style: TextStyle(fontSize: 10, color: Colors.grey.shade600)),
+                  const SizedBox(width: 4),
+                  Text('${dur.toStringAsFixed(0)}초',
+                      style: TextStyle(fontSize: 10, color: Colors.grey.shade700,
+                          fontWeight: FontWeight.bold)),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(detail,
+                          style: TextStyle(fontSize: 10, color: Colors.blueGrey.shade700),
+                          overflow: TextOverflow.ellipsis),
+                      if (action.isNotEmpty)
+                        Text('→ $action',
+                            style: TextStyle(fontSize: 9, color: Colors.teal.shade600),
+                            overflow: TextOverflow.ellipsis),
+                    ]),
+                  ),
+                ]),
+              );
+            }),
+          ],
+        ],
+      ),
+    );
+  }
+
   // ============================================================
   Widget _buildPingBreakdown(RobotData data) {
     Widget seg(String label, double ms) {
@@ -1388,9 +1624,40 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
     );
   }
 
+  // Ping 셀: 60초 평균 우선 표시 + 손실률 부가정보
+  Widget _buildPingCell(RobotData d) {
+    final hasAvg = d.pingAvg60s > 0;
+    final displayMs = hasAvg ? d.pingAvg60s : d.currentPing;
+    final color = _pingColor(displayMs);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(mainAxisSize: MainAxisSize.min, children: [
+          Text('${displayMs.toInt()}',
+              style: TextStyle(fontSize: 13, color: color, fontWeight: FontWeight.bold)),
+          Text('ms', style: TextStyle(fontSize: 10, color: color.withOpacity(0.8))),
+        ]),
+        if (hasAvg)
+          Text('avg60s', style: TextStyle(fontSize: 8, color: Colors.grey.shade500))
+        else
+          Text('now', style: TextStyle(fontSize: 8, color: Colors.grey.shade400)),
+        if (d.pingLossPct > 0)
+          Text('손실 ${d.pingLossPct.toStringAsFixed(0)}%',
+              style: TextStyle(
+                  fontSize: 8,
+                  color: d.pingLossPct >= 15 ? Colors.red
+                      : d.pingLossPct >= 5 ? Colors.orange
+                      : Colors.grey.shade500,
+                  fontWeight: d.pingLossPct >= 5 ? FontWeight.bold : FontWeight.normal)),
+      ],
+    );
+  }
+
   Widget _buildLatencySrcBadge(String src) {
     if (src.isEmpty) return _tdDash();
     final color = _latencySrcColor(src);
+    final label = _latencySrcLabel(src);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
       decoration: BoxDecoration(
@@ -1398,11 +1665,26 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
         borderRadius: BorderRadius.circular(4),
         border: Border.all(color: color.withOpacity(0.4)),
       ),
-      child: Text(src,
+      child: Text(label,
           style: TextStyle(
               fontSize: 9, color: color, fontWeight: FontWeight.bold),
           overflow: TextOverflow.ellipsis),
     );
+  }
+
+  // 표시 레이블 (영문 코드 → 한국어 약어)
+  String _latencySrcLabel(String src) {
+    switch (src) {
+      case 'NORMAL':        return 'NORMAL';
+      case 'WIFI_POOR':     return 'WiFi불량';
+      case 'DEGRADED':      return '성능저하';
+      case 'PACKET_LOSS':   return '패킷손실';
+      case 'WIFI_DOWN':     return 'WiFi단절';
+      case 'MOXA_LAN_DOWN': return 'MOXA끊김';
+      case 'SERVER_DOWN':   return '서버단절';
+      case 'NETWORK_ISSUE': return '네트워크';
+      default:              return src;
+    }
   }
 
   Color _latencyColor(double ms) {
@@ -1416,7 +1698,9 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
   Color _latencySrcColor(String src) {
     switch (src) {
       case 'NORMAL':        return Colors.green;
+      case 'DEGRADED':      return Colors.amber.shade700;
       case 'WIFI_POOR':     return Colors.orange;
+      case 'PACKET_LOSS':   return Colors.deepOrange;
       case 'WIFI_DOWN':     return Colors.red;
       case 'MOXA_LAN_DOWN': return Colors.red;
       case 'SERVER_DOWN':   return Colors.deepOrange;
@@ -1564,6 +1848,21 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
                           style: TextStyle(
                               color: Colors.white.withOpacity(0.85),
                               fontSize: 9)),
+                      // 끊김 횟수 (1시간 내) — 핵심 운영 지표
+                      if (data.diagDisconnect1h > 0)
+                        Text('✕${data.diagDisconnect1h}',
+                            style: TextStyle(
+                                color: data.diagDisconnect1h >= 3
+                                    ? Colors.red.shade300
+                                    : Colors.orange.shade300,
+                                fontSize: 8,
+                                fontWeight: FontWeight.bold))
+                      // 끊김 없고 로밍만 있으면 로밍 카운터 표시
+                      else if (data.roamCount10min > 0)
+                        Text('${data.roamCount10min}r',
+                            style: TextStyle(
+                                color: Colors.white.withOpacity(0.6),
+                                fontSize: 8)),
                     ],
                   ),
                 ),

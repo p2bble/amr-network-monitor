@@ -394,11 +394,21 @@ quit
 
 | 항목 | 권장값 | 이유 |
 |------|--------|------|
-| roamingDifference5G | **8** | 핑퐁 로밍 방지 |
+| roamingDifference5G | **8** | 핑퐁 로밍 방지 (아래 주의사항 참조) |
 | roamingThreshold5G_Signal | **-75** | 불필요한 로밍 감소 |
 | rmtConnCheckRebootDevice | **DISABLE** | 서버 ping 실패 시 재부팅 방지 |
 | rmtConnCheckCheckTimeout | **2000ms** | 안정적 판정 |
 | rmtConnCheckRetryInterval | **3** | timeout보다 커야 함 |
+
+> **⚠ roamingDifference5G 경험값 주의**
+> - **6**: 기본값. AP 밀집 환경에서 핑퐁 로밍 발생 가능.
+> - **12**: 2026-04-20 적용 테스트 → 13대 전체 동시 단절 발생 (60~385초). 조밀한 AP 환경에서 12dB 이상 강한 AP를 찾지 못해 열화 AP에 고착 → 완전 끊김.
+> - **8**: 핑퐁 감소 + 대량 단절 없는 균형값 (권장).
+>
+> **AP-12 SNR=0 로그에 대하여**
+> MOXA 로밍 로그에서 "Roaming from AP-12 [SNR: 0]" 패턴은 802.11r 미지원 환경에서의 정상 동작.
+> 비-802.11r 로밍 시 연결 해제 후 재연결(full reassociation) 방식이므로 이탈 시점의 SNR 측정값이 0으로 기록됨.
+> AP ping 정상이면 AP 하드웨어 이상 아님 — 로봇 이동 경로 상 RF 커버리지 경계 구간 문제.
 
 ---
 
@@ -438,6 +448,13 @@ for i in $(seq 31 45); do echo "=== AP $(( i - 30 )) (192.168.145.$i) ==="; ssh 
 
 | 날짜 | 내용 |
 |------|------|
+| 2026-04-20 | `amr_unified_agent.py`: PING_WARN/CRIT_THRESHOLD NameError 크래시 수정 (에이전트 무응답 원인) |
+| 2026-04-20 | `amr_unified_agent.py`: 로밍 로그의 `ping_gw_ms` undefined NameError 수정 |
+| 2026-04-20 | `amr_unified_agent.py`: `get_lan_ip()` 5분 캐시 추가 (매 루프 subprocess 오버헤드 제거) |
+| 2026-04-20 | `amr_unified_agent.py`: ping timeout 2s → 1s (루프 지연 개선) |
+| 2026-04-20 | `ap_admin_config.json`: AP-12 `SHUTDOWN` → `ACTIVE` 수정 (radio 정상 운영 확인) |
+| 2026-04-20 | Roaming Difference=12 적용 테스트 → 전체 13대 동시 단절 확인 → 6 복원, **8 권장**으로 확정 |
+| 2026-04-20 | AP-12 SNR=0 로그 분석: 비-802.11r 환경의 정상 이탈 측정값 (AP 장애 아님) 확인 |
 | 2026-04-20 | `amr_unified_agent.py`: MOXA LAN / AP GW / 서버 3단계 병렬 ping 추가 (`ping_multi`) |
 | 2026-04-20 | `amr_unified_agent.py`: `diagnose_latency()` — 지연 구간 자동 추론 (`latency_src` 필드) |
 | 2026-04-20 | `amr_unified_agent.py`: Sticky Client 감지 (RSSI < -75 + 30초 로밍 없음 → WARN) |
