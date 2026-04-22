@@ -46,7 +46,13 @@ _sticky_alerted    = False
 
 # ── 슬라이딩 윈도우 (60초 rolling — 배경 지표, 서버 진단용) ──
 _ping_srv_window = collections.deque(maxlen=WINDOW_SIZE)
-_roam_timestamps = collections.deque()   # 로밍 발생 시각 (10분 윈도우)
+# (timestamp, from_bssid, to_bssid) — 최근 20회 로밍 이력
+_roam_history = collections.deque(maxlen=20)
+
+# ── 연속 ping 실패 카운터 (로밍 순단 vs 실질 단절 구분) ────────
+# 1~2회 실패: 로밍 순단 (Transient, 통계 노이즈 — 무시)
+# 3회 이상  : 실질 단절 (Sustained — CROMS 30초 알람 전 조기 경고)
+_ping_fail_streak = 0
 
 def _window_stats(window):
     """슬라이딩 윈도우 → (avg_ms, loss_pct). -1은 loss 처리."""
@@ -60,9 +66,39 @@ def _window_stats(window):
 
 def _roam_count_10min():
     now = time.time()
-    while _roam_timestamps and now - _roam_timestamps[0] > 600:
-        _roam_timestamps.popleft()
-    return len(_roam_timestamps)
+    return sum(1 for t, _, _ in _roam_history if now - t <= 600)
+
+def _detect_pingpong(window_sec=300, min_bounces=3):
+    """
+    ping-pong 로밍 감지: window_sec 내에 동일한 두 AP 사이에서
+    min_bounces회 이상 교대로 왔다갔다하는 패턴.
+
+    이동 중 자연스러운 로밍(다른 AP로 순차 전환)은 해당 안 됨.
+    반환: (is_pingpong: bool, pair_str: str)
+    """
+    now = time.time()
+    recent = [(t, f, to) for t, f, to in _roam_history if now - t <= window_sec]
+    if len(recent) < min_bounces:
+        return False, ""
+
+    # 최근 min_bounces+1개의 목적지 BSSID 추출
+    dest_bssids = [to for _, _, to in recent[-(min_bounces + 1):]]
+    if len(dest_bssids) < min_bounces:
+        return False, ""
+
+    # 정확히 2개의 BSSID만 사용되는지 확인
+    unique = set(dest_bssids)
+    if len(unique) != 2:
+        return False, ""
+
+    # 교대 패턴 확인: ABAB... 또는 BABA...
+    for i in range(1, len(dest_bssids)):
+        if dest_bssids[i] == dest_bssids[i - 1]:
+            return False, ""
+
+    bssids = sorted(unique)
+    pair_str = f"{bssids[0][:11]} ↔ {bssids[1][:11]}"
+    return True, pair_str
 
 # ── 파일 로깅 ───────────────────────────────────────────────
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -297,7 +333,7 @@ def connect_mqtt():
 
 # ── 메인 실행 루프 ───────────────────────────────────────────
 def main():
-    global active_mode, latest_log_msg, _bssid_stuck_since, _sticky_alerted
+    global active_mode, latest_log_msg, _bssid_stuck_since, _sticky_alerted, _ping_fail_streak
 
     active_mode = detect_environment()
     log_event("START", f"에이전트 시작 — 모드: {active_mode}")
@@ -329,6 +365,19 @@ def main():
         _ping_srv_window.append(ping_latency)
         ping_avg_60s, ping_loss_pct = _window_stats(_ping_srv_window)
         roam_count_10min            = _roam_count_10min()
+
+        # ── 연속 실패 카운터 업데이트 ──────────────────────────
+        # 로밍 순단(1~2회)은 Transient로 분류 — 통계 노이즈 제외
+        # 3회 이상 연속 실패(≥15초)만 실질 단절(Sustained)로 판정
+        if ping_latency < 0:
+            _ping_fail_streak += 1
+            if _ping_fail_streak == 3:
+                log_event("WARN", f"연속 3회 ping 실패 (15초) — 실질 단절 의심 (로밍 아님)")
+        else:
+            if _ping_fail_streak >= 3:
+                log_event("INFO", f"ping 복구 — {_ping_fail_streak}회 연속 실패에서 정상화")
+            _ping_fail_streak = 0
+        sustained_loss = _ping_fail_streak >= 3
 
         if active_mode == "MOXA":
             iface_name  = LAN_IFACE
@@ -371,8 +420,12 @@ def main():
 
         # ── 이벤트 감지: 로밍 (BSSID 변경) ────────────────
         if prev_bssid and prev_bssid != bssid and bssid not in ("Disconnected", "Error", "Unknown"):
-            log_event("ROAM", f"로밍 발생: {prev_bssid} → {bssid} (Ch: {channel}, RSSI: {rssi})")
-            _roam_timestamps.append(time.time())  # 10분 윈도우용 타임스탬프
+            _roam_history.append((time.time(), prev_bssid, bssid))
+            pp, pp_pair = _detect_pingpong()
+            if pp:
+                log_event("WARN", f"PING-PONG 로밍: {pp_pair} (5분 내 반복)")
+            else:
+                log_event("ROAM", f"로밍 발생: {prev_bssid} → {bssid} (Ch: {channel}, RSSI: {rssi})")
             _bssid_stuck_since = None
             _sticky_alerted    = False
         prev_bssid = bssid
@@ -425,7 +478,9 @@ def main():
             "interface_type":   iface_type,
             "ping_ms":          ping_latency,       # 서버 ping 순간값 (진단 참고용)
             "ping_avg_60s":     ping_avg_60s,       # 60초 평균 ping
-            "ping_loss_pct":    ping_loss_pct,      # 60초 패킷 손실률 (%)
+            "ping_loss_pct":    ping_loss_pct,      # 60초 패킷 손실률 (raw, 로밍 순단 포함)
+            "ping_fail_streak": _ping_fail_streak,  # 연속 실패 횟수 (1~2=순단, 3+=실질단절)
+            "sustained_loss":   sustained_loss,     # 3회 이상 연속 실패 = 실질 단절
             "bssid":            bssid,
             "ssid":             ssid,
             "channel":          channel,
@@ -433,7 +488,9 @@ def main():
             "status":           status,
             "latest_log":       latest_log_msg,
             "reconnect_count":  reconnect_count,    # MQTT 재연결 누적 (핵심 지표)
-            "roam_count_10min": roam_count_10min,   # 10분 내 로밍 횟수
+            "roam_count_10min": roam_count_10min,   # 10분 내 로밍 횟수 (정보용)
+            "pingpong":         _detect_pingpong()[0],   # ping-pong 감지 여부
+            "pingpong_pair":    _detect_pingpong()[1],   # ping-pong 대상 AP 쌍
             "srv_ip":           SERVER_IP,
             "pc_ip":            get_lan_ip(),
             "freq_mhz":         freq_mhz,

@@ -18,7 +18,7 @@
     "AP-09":  "ACTIVE",
     "AP-10":  "DISABLED",
     "AP-11":  "ACTIVE",
-    "AP-12":  "ACTIVE",
+    "AP-12":  "SHUTDOWN",
     "AP-13":  "ACTIVE",
     "AP-14":  "SHUTDOWN",
     "AP-15":  "SHUTDOWN"

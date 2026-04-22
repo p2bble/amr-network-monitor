@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+// ignore: avoid_web_libraries_in_flutter
+import 'dart:html' as html;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mqtt_client/mqtt_client.dart';
@@ -16,7 +18,7 @@ class AmrMonitorApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AMR Network Dashboard',
+      title: '세방전지 AMR 통신 관제',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         useMaterial3: true,
@@ -28,18 +30,30 @@ class AmrMonitorApp extends StatelessWidget {
 }
 
 // ============================================================
-// [A] 장애 계층 + 자동 진단 결과 모델
+// [A] 장애 계층 + 심각도 + 자동 진단 결과 모델
 // ============================================================
 enum FaultLayer { normal, ap, moxa, network, server, agent }
 
+/// AMR 운영 영향 기반 4단계 심각도
+/// 일반 IT 기준이 아닌 MOXA + 물류 창고 환경 기준
+enum AlertLevel {
+  offline,  // 🔴 끊김  — AMR 실제 통신 단절 또는 즉시 단절 상태
+  danger,   // 🟠 위험  — 수초~수십초 내 단절 위험, 즉시 확인 필요
+  warning,  // 🟡 경고  — 품질 저하, 운영은 가능하나 주시 필요
+  caution,  // 🔵 주의  — 환경 불량이나 AMR 운영 영향 없음
+  normal,   // 🟢 정상  — 모든 지표 정상
+}
+
 class DiagnosisResult {
   final FaultLayer layer;
+  final AlertLevel alertLevel;
   final String summary;
   final String detail;
   final String action;
   final Color badgeColor;
   const DiagnosisResult({
     required this.layer,
+    required this.alertLevel,
     required this.summary,
     required this.detail,
     required this.action,
@@ -48,24 +62,27 @@ class DiagnosisResult {
 }
 
 // ============================================================
-// [B] 자동 장애 원인 분류 엔진
+// [B] 자동 장애 원인 분류 엔진 — AMR/MOXA 물류 창고 전용
 // ============================================================
 class DiagnosisEngine {
-  // ── 임계값 (산업 표준 기반: Cisco/Aruba 5GHz 창고 환경 권고치) ──
-  static const int    _rssiWeak      = -75;   // dBm: 경계 구간 (60초 지속 시)
-  static const int    _rssiCritical  = -80;   // dBm: 실질 불통 구간 (기존 -85 → -80, 5GHz 실사용 하한)
-  static const int    _pingHighMs    = 80;    // ms: 60초 평균 경고 (기존 100 → 80, AMR 제어 권고치)
-  static const int    _pingCritMs    = 200;   // ms: 60초 평균 심각 (기존 500 → 200, 순간값 스파이크 아님)
+  // ── AMR 운영 영향 기반 임계값 (일반 IT 기준 아님) ─────────────
+  // MOXA AWK-1137C + H3C WA6320 + 폐쇄망 물류 창고 환경 기준
+  static const int    _rssiWarn      = -75;   // dBm: 로밍 필요 구간 → [경고]
+  static const int    _rssiDanger    = -80;   // dBm: 실질 음영 근접 → [위험]
+  static const int    _pingCaution   = 100;   // ms: AMR 운영엔 이상 없음 → [주의]
+  static const int    _pingWarn      = 300;   // ms: 제어 응답 지연 시작 → [경고]
+  static const int    _pingDanger    = 500;   // ms: 제어 불안정 구간 → [위험]
   static const int    _agentTimeout  = 30;    // 초: 에이전트 무응답
-  static const int    _roamingFreq   = 5;     // 회: 10분 내 로밍 횟수 경고 (기존 3회/5분)
-  static const double _packetLossWarn = 5.0;  // %: 60초 손실률 경고
-  static const double _packetLossCrit = 15.0; // %: 60초 손실률 심각 (신규)
-  static const double _cpuHigh       = 85.0;
+  // 로밍 1회 ≈ ping 1회 누락 ≈ 8.3% (60s 12회 윈도우)
+  // → sustainedLoss/pingFailStreak 이 실질 단절 감지 담당
+  // → raw 손실률은 높은 임계값으로 오탐 방지
+  static const double _packetLossWarn   = 15.0; // %: 로밍 2회 이상 → [경고]
+  static const double _packetLossDanger = 25.0; // %: 지속적 손실 → [위험]
+  static const double _cpuHigh          = 85.0;
+  static const double _retryWarn        = 20.0; // TX Retry % → [경고]
+  static const double _retryDanger      = 30.0; // TX Retry % → [위험]
 
-  // 같은 BSSID(AP)의 다른 로봇들과 Retry율을 비교해 국소 간섭 여부를 판별합니다.
-  // true  = 이 로봇만 Retry 높음 → 위치 특화 국소 간섭
-  // false = 같은 AP 전체 Retry 높음 → Co-channel 혼잡
-  // null  = 비교 대상 없음 (판별 불가)
+  // 같은 AP(BSSID)의 타 로봇 Retry와 비교: 국소 간섭 vs Co-channel 혼잡
   static bool? _isLocalizedInterference(RobotData d, Map<String, RobotData>? allRobots) {
     if (allRobots == null) return null;
     final peers = allRobots.values.where((r) =>
@@ -76,218 +93,289 @@ class DiagnosisEngine {
         r.currentBssid != 'Error' &&
         r.txRetryRate >= 0).toList();
     if (peers.isEmpty) return null;
-    final avgRetry = peers.map((r) => r.txRetryRate).reduce((a, b) => a + b) / peers.length;
-    return avgRetry < 10.0; // 다른 로봇 평균 Retry < 10% 이면 국소 간섭
+    final avg = peers.map((r) => r.txRetryRate).reduce((a, b) => a + b) / peers.length;
+    return avg < 10.0;
   }
 
   static DiagnosisResult analyze(RobotData d, {Map<String, RobotData>? allRobots}) {
     final agentSilent = d.lastReceived != null &&
         DateTime.now().difference(d.lastReceived!).inSeconds > _agentTimeout;
 
+    // ════════════════════════════════════════════════════════
+    // 🔴 끊김 — AMR 실제 통신 단절 상태
+    // ════════════════════════════════════════════════════════
     if (agentSilent) {
       if (d.cpuPct >= 0 && d.cpuPct > _cpuHigh) {
         return DiagnosisResult(
           layer: FaultLayer.agent,
-          summary: '미니PC CPU 과부하',
-          detail: 'CPU ${d.cpuPct.toInt()}% — 에이전트 프로세스 응답 불가',
-          action: '미니PC 재시작 또는 프로세스 확인\n→ systemctl status amr-agent\n→ top / htop 으로 CPU 점유 프로세스 확인',
-          badgeColor: Colors.deepOrange,
+          alertLevel: AlertLevel.offline,
+          summary: '[끊김] 미니PC 과부하',
+          detail: 'CPU ${d.cpuPct.toInt()}% — 에이전트 정지 상태\n'
+              'CROMS "Server Not Connect" 알람 발생 중',
+          action: '미니PC 재시작 필요\n'
+              '→ systemctl status amr-agent\n'
+              '→ top / htop 으로 CPU 점유 프로세스 확인\n'
+              '→ 이상 프로세스 종료 또는 미니PC 재부팅',
+          badgeColor: Colors.red,
         );
       }
       final sec = DateTime.now().difference(d.lastReceived!).inSeconds;
       return DiagnosisResult(
         layer: FaultLayer.agent,
-        summary: '에이전트 무응답',
-        detail: '미니PC 에이전트가 ${sec}초째 데이터 미전송',
-        action: '에이전트 프로세스 확인\n→ ps aux | grep amr_agent\n→ systemctl restart amr-agent\n→ 미니PC 전원 상태 및 네트워크 케이블 확인',
-        badgeColor: Colors.deepOrange,
+        alertLevel: AlertLevel.offline,
+        summary: '[끊김] 에이전트 무응답',
+        detail: '미니PC 에이전트 ${sec}초째 미전송\n'
+            'CROMS "Server Not Connect" 알람 발생 중',
+        action: '에이전트 프로세스 확인\n'
+            '→ ps aux | grep amr_agent\n'
+            '→ systemctl restart amr-agent\n'
+            '→ 미니PC 전원 및 네트워크 케이블 확인',
+        badgeColor: Colors.red,
       );
     }
     if (d.moxaConnected == false) {
       return DiagnosisResult(
         layer: FaultLayer.moxa,
-        summary: 'MOXA 연결 단절',
-        detail: 'MOXA 장비와의 링크 단절 (MOXA RSSI: ${d.moxaRssi} dBm)',
-        action: 'MOXA 전원/LED 상태 확인\n→ MOXA 관리 페이지 접속 (기본: 192.168.127.253)\n→ 안테나/케이블 체결 상태 점검\n→ MOXA 재부팅 후 링크 재확인',
+        alertLevel: AlertLevel.offline,
+        summary: '[끊김] MOXA 단절',
+        detail: 'MOXA와 미니PC 간 링크 단절\n'
+            'AMR 무선 통신 완전 중단 상태',
+        action: 'MOXA 전원/LED 확인\n'
+            '→ MOXA 관리 페이지 접속 (192.168.145.5x)\n'
+            '→ LAN 케이블 체결 상태 점검\n'
+            '→ MOXA 재부팅 후 링크 재확인',
         badgeColor: Colors.red,
       );
     }
     if (d.pingGwMs >= 0 && d.pingGwMs == 0) {
       return DiagnosisResult(
         layer: FaultLayer.ap,
-        summary: 'AP 게이트웨이 도달 불가',
-        detail: '게이트웨이 Ping 실패 — AP 장애 또는 VLAN 단절',
-        action: 'FortiAP 연결 상태 확인\n→ FortiGate > WiFi Clients 탭 확인\n→ VLAN ${d.vlanId.isNotEmpty ? d.vlanId : "설정값"} 트렁크 포트 점검',
+        alertLevel: AlertLevel.offline,
+        summary: '[끊김] AP 도달 불가',
+        detail: 'AP 게이트웨이 Ping 실패\n'
+            'AP 전원 꺼짐 또는 유선 단절',
+        action: 'AP 전원 및 PoE 스위치 포트 확인\n'
+            '→ AP LED 상태 확인\n'
+            '→ 스위치 → AP 케이블 체결 점검',
         badgeColor: Colors.red,
       );
     }
     if (d.pingGwMs > 0 && d.pingSrvMs >= 0 && d.pingSrvMs == 0) {
       return DiagnosisResult(
         layer: FaultLayer.server,
-        summary: '관제서버 도달 불가',
-        detail: 'AP 구간 정상 / 관제서버(MQTT) Ping 실패',
-        action: '관제서버 상태 확인\n→ docker ps | grep emqx\n→ 방화벽 8083 포트 허용 여부 점검',
+        alertLevel: AlertLevel.offline,
+        summary: '[끊김] 관제서버 불가',
+        detail: 'AP 구간 정상 / MQTT 서버 Ping 실패\n'
+            'CROMS 알람 발생 중',
+        action: '관제서버 상태 확인\n'
+            '→ docker ps | grep emqx\n'
+            '→ 방화벽 1883 / 8083 포트 허용 확인',
         badgeColor: Colors.red,
       );
     }
-    // 패킷 손실: 60초 윈도우 우선, 없으면 레거시 packetLoss 사용
-    final effectiveLoss = d.pingLossPct > 0 ? d.pingLossPct
-        : (d.packetLoss >= 0 ? d.packetLoss : 0.0);
-    if (effectiveLoss > _packetLossCrit) {
+
+    // ════════════════════════════════════════════════════════
+    // 🟠 위험 — 수초~수십초 내 끊김 위험, 즉시 확인
+    // ════════════════════════════════════════════════════════
+    if (d.sustainedLoss || d.pingFailStreak >= 3) {
+      final streakSec = d.pingFailStreak * 5;
       return DiagnosisResult(
         layer: FaultLayer.network,
-        summary: '패킷 손실 심각 ${effectiveLoss.toInt()}% (60s)',
-        detail: '60초 평균 패킷 손실 ${effectiveLoss.toStringAsFixed(1)}% — 연속 연결 불안정',
-        action: '무선 채널 점검\n→ 인접 AP 채널 분리 (5GHz 권장)\n→ MOXA 안테나 상태 확인',
-        badgeColor: Colors.red,
+        alertLevel: AlertLevel.danger,
+        summary: '[위험] 연속 단절 ${d.pingFailStreak}회 (${streakSec}초)',
+        detail: 'ping ${d.pingFailStreak}회 연속 실패 → ${streakSec}초 이상 서버 미도달\n'
+            'CROMS 알람(30초) 전 단계 — 즉시 확인 필요\n'
+            '※ 로밍 순단(1~2회)은 정상, 이 경우는 실질 단절',
+        action: 'MOXA LED 및 웹UI 상태 확인\n'
+            '→ 로봇 동선 상 음영구간 진입 여부 점검\n'
+            '→ AP ping 정상 여부 확인\n'
+            '→ 증상 지속 시 MOXA 재부팅',
+        badgeColor: Colors.deepOrange,
+      );
+    }
+    final effectiveLoss = d.pingLossPct > 0 ? d.pingLossPct
+        : (d.packetLoss >= 0 ? d.packetLoss : 0.0);
+    if (effectiveLoss > _packetLossDanger) {
+      return DiagnosisResult(
+        layer: FaultLayer.network,
+        alertLevel: AlertLevel.danger,
+        summary: '[위험] 패킷 손실 ${effectiveLoss.toInt()}%',
+        detail: '60초 평균 패킷 손실 ${effectiveLoss.toStringAsFixed(1)}%\n'
+            '로밍 순단 외 지속적 손실 — 채널/AP 문제',
+        action: '무선 채널 점검\n'
+            '→ 인접 AP 채널 분리 확인 (Ch 149 단독 사용 권장)\n'
+            '→ MOXA 안테나 체결 상태 확인',
+        badgeColor: Colors.deepOrange,
+      );
+    }
+    if (d.rssiAvailable && d.currentRssi < _rssiDanger) {
+      return DiagnosisResult(
+        layer: FaultLayer.ap,
+        alertLevel: AlertLevel.danger,
+        summary: '[위험] 음영구간 (${d.currentRssi}dBm)',
+        detail: 'RSSI ${d.currentRssi} dBm — AMR 통신 불안정 구간\n'
+            '로밍이 발생해야 하는데 안 되고 있을 가능성',
+        action: 'AP 커버리지 재검토\n'
+            '→ MOXA roamingThreshold5G -75dBm 확인\n'
+            '→ 해당 구역 AP Tx Power 상향 또는 AP 추가',
+        badgeColor: Colors.deepOrange,
+      );
+    }
+    if (d.txRetryRate >= 0 && d.txRetryRate > _retryDanger) {
+      final localized = _isLocalizedInterference(d, allRobots);
+      final isLocal = localized == true;
+      return DiagnosisResult(
+        layer: FaultLayer.network,
+        alertLevel: AlertLevel.danger,
+        summary: '[위험] ${isLocal ? "국소 간섭" : "채널 혼잡"} (Retry ${d.txRetryRate.toInt()}%)',
+        detail: isLocal
+            ? '이 로봇만 TX Retry 높음 — 로봇 주변 RF 간섭\n'
+              '(같은 AP 다른 로봇은 정상)'
+            : '같은 AP 다수 로봇 TX Retry 높음 — Co-channel 혼잡\n'
+              '${d.band.isNotEmpty ? "대역: ${d.band}" : ""}',
+        action: isLocal
+            ? '로봇 주변 금속/모터/인버터 EMI 점검\n'
+              '→ MOXA 안테나 위치 조정 (로봇 상단 권장)'
+            : 'AP 채널 분리 점검\n'
+              '→ 5GHz Ch 149 단독 사용 유지\n'
+              '→ 주변 기기 간섭 여부 확인',
+        badgeColor: Colors.deepOrange,
+      );
+    }
+    final effectivePing = d.pingAvg60s > 0 ? d.pingAvg60s : d.currentPing;
+    if (effectivePing > _pingDanger) {
+      final label = d.pingAvg60s > 0 ? '${effectivePing.toInt()}ms(60s평균)' : '${effectivePing.toInt()}ms';
+      return DiagnosisResult(
+        layer: FaultLayer.network,
+        alertLevel: AlertLevel.danger,
+        summary: '[위험] Ping $label',
+        detail: '60초 평균 Ping ${effectivePing.toInt()}ms — AMR 제어 응답 불안정 구간\n'
+            '로밍 중 순간 스파이크와 달리 지속적 지연',
+        action: '백본 스위치 포트 에러 확인\n'
+            '→ STP 루프 여부 점검\n'
+            '→ EMQX 브로커 부하 확인 (docker stats emqx)',
+        badgeColor: Colors.deepOrange,
+      );
+    }
+
+    // ════════════════════════════════════════════════════════
+    // 🟡 경고 — 품질 저하, 운영 가능하나 주시 필요
+    // ════════════════════════════════════════════════════════
+    final isPingpong = d.pingpong || d.dashboardPingpong;
+    final ppPair     = d.pingpong ? d.pingpongPair : d.dashboardPingpongPair;
+    final roamCount  = d.roamCount10min > 0 ? d.roamCount10min : d.recentRoamingCount;
+    if (isPingpong) {
+      return DiagnosisResult(
+        layer: FaultLayer.ap,
+        alertLevel: AlertLevel.warning,
+        summary: '[경고] Ping-pong 로밍${ppPair.isNotEmpty ? " ($ppPair)" : ""}',
+        detail: '동일 AP 쌍 반복 전환 (5분 내 3회 이상)\n'
+            '${ppPair.isNotEmpty ? "대상: $ppPair\n" : ""}'
+            '현재 운영은 유지되나 불안정 로밍 반복 중\n'
+            '로밍 횟수: ${roamCount}회',
+        action: 'MOXA roamingDifference5G 8 이상 상향\n'
+            '→ roamingThreshold5G -75dBm 확인\n'
+            '→ 해당 구역 AP 출력 균형 점검',
+        badgeColor: Colors.amber,
       );
     }
     if (effectiveLoss > _packetLossWarn) {
       return DiagnosisResult(
         layer: FaultLayer.network,
-        summary: '패킷 손실 ${effectiveLoss.toInt()}% (60s)',
-        detail: '60초 평균 패킷 손실 ${effectiveLoss.toStringAsFixed(1)}% — 간헐적 연결 불안정',
-        action: '무선 채널 점검\n→ 인접 AP 채널 분리 (5GHz 권장)\n→ MOXA Tx Power 조정',
-        badgeColor: Colors.orange,
-      );
-    }
-    if (!d.rssiAvailable) {
-      return DiagnosisResult(
-        layer: FaultLayer.moxa,
-        summary: 'MOXA SNMP 미수신',
-        detail: 'RSSI/채널 데이터 없음 — moxa-poller 또는 MOXA SNMP 설정 확인',
-        action: 'sudo systemctl status moxa-poller\n→ MOXA 웹UI: SNMP Enable + Save Configuration + 재부팅',
-        badgeColor: Colors.orange,
-      );
-    }
-    if (d.currentRssi < _rssiCritical) {
-      return DiagnosisResult(
-        layer: FaultLayer.ap,
-        summary: '음영구간 (${d.currentRssi}dBm)',
-        detail: 'RSSI ${d.currentRssi} dBm — 통신 불가 수준',
-        action: '해당 구역 AP 추가 설치 필요\n→ 로봇 동선 기반 RF 설계 재검토',
-        badgeColor: Colors.red,
-      );
-    }
-    if (d.currentRssi < _rssiWeak) {
-      return DiagnosisResult(
-        layer: FaultLayer.ap,
-        summary: 'AP 신호 약함 (${d.currentRssi}dBm)',
-        detail: 'RSSI ${d.currentRssi} dBm — 경계 구간, 로밍 빈발 가능성',
-        action: 'AP Tx Power 상향 또는 AP 추가 검토\n→ MOXA 로밍 임계값 -70 dBm 권장',
-        badgeColor: Colors.orange,
-      );
-    }
-    // ── TX Retry율 기반 채널 간섭 진단 ──────────────────────────
-    // 같은 AP(BSSID)의 타 로봇 Retry와 비교해 원인을 3분기로 구분:
-    //   localized=true  → 이 로봇만 높음: 위치 특화 국소 간섭
-    //   localized=false → 같은 AP 전체 높음: Co-channel 혼잡
-    //   localized=null  → 비교 대상 없음: 원인 특정 불가
-    if (d.txRetryRate >= 0 && d.txRetryRate > 30) {
-      final localized = _isLocalizedInterference(d, allRobots);
-      if (localized == true) {
-        return DiagnosisResult(
-          layer: FaultLayer.network,
-          summary: '국소 간섭 심각 (Retry ${d.txRetryRate.toInt()}%)',
-          detail: '같은 AP의 다른 로봇은 Retry 정상\n'
-              '→ 이 로봇 위치 특화 RF 간섭 (Retry ${d.txRetryRate.toStringAsFixed(1)}%)\n'
-              '채널 혼잡이 아닌 로봇 주변 환경 문제${d.band.isNotEmpty ? "\n대역: ${d.band}" : ""}',
-          action: '→ 로봇 주변 금속 구조물 / 모터 / 인버터 EMI 점검\n'
-              '→ USB WiFi 안테나 위치 조정 (로봇 상단 노출 권장)\n'
-              '→ 로봇을 다른 위치로 이동 후 Retry 변화 확인\n'
-              '→ WiFi 어댑터 드라이버 및 전원 절전 설정 점검',
-          badgeColor: Colors.deepOrange,
-        );
-      }
-      final coDetail = localized == false
-          ? '같은 AP(${d.currentBssid}) 다른 로봇도 Retry 높음 → AP 레벨 채널 혼잡\n'
-          : '(비교 대상 로봇 없음 — 원인 특정 불가)\n';
-      final coAction = d.band == '2.4GHz'
-          ? '2.4GHz 대역 — 5GHz 고정 운영 강력 권장\n→ AP 채널 1 / 6 / 11 비중복 배치 확인'
-          : d.band == '5GHz'
-              ? 'DFS 채널 회피 권장 (52~144번 → 36~48번 또는 149~165번)\n→ 주변 AP 채널 분리 점검'
-              : 'AP 채널 재배치 검토\n→ 비중복 채널 사용 확인';
-      return DiagnosisResult(
-        layer: FaultLayer.network,
-        summary: '채널 혼잡 심각 (Retry ${d.txRetryRate.toInt()}%)',
-        detail: '${coDetail}TX Retry율 ${d.txRetryRate.toStringAsFixed(1)}% — 재전송 과다'
-            '${d.band.isNotEmpty ? "\n현재 대역: ${d.band}" : ""}',
-        action: coAction,
-        badgeColor: Colors.deepOrange,
-      );
-    }
-    if (d.txRetryRate >= 0 && d.txRetryRate > 20) {
-      final localized = _isLocalizedInterference(d, allRobots);
-      if (localized == true) {
-        return DiagnosisResult(
-          layer: FaultLayer.network,
-          summary: '국소 간섭 의심 (Retry ${d.txRetryRate.toInt()}%)',
-          detail: '같은 AP의 다른 로봇은 Retry 정상\n'
-              '→ 이 로봇 위치 특화 간섭 의심 (Retry ${d.txRetryRate.toStringAsFixed(1)}%)'
-              '${d.band.isNotEmpty ? "\n대역: ${d.band}" : ""}',
-          action: '→ 로봇 주변 금속 / EMI 발생 장비 점검\n'
-              '→ WiFi 안테나 위치 확인\n'
-              '→ 로봇 이동 후 Retry율 변화 확인',
-          badgeColor: Colors.orange,
-        );
-      }
-      final coDetail = localized == false ? '같은 AP 다른 로봇도 Retry 높음 → AP 레벨 채널 경쟁\n' : '';
-      final coAction = d.band == '2.4GHz'
-          ? '2.4GHz 채널 간섭 — 5GHz 전환 검토\n→ AP 채널 1 / 6 / 11 비중복 배치'
-          : d.band == '5GHz'
-              ? '5GHz 채널 경쟁\n→ 비DFS 채널(36~48 / 149~165) 사용 확인\n→ 주변 AP와 채널 분리'
-              : '채널 간섭 의심 — AP 채널 점검';
-      return DiagnosisResult(
-        layer: FaultLayer.network,
-        summary: '채널 간섭 의심 (Retry ${d.txRetryRate.toInt()}%)',
-        detail: '${coDetail}TX Retry율 ${d.txRetryRate.toStringAsFixed(1)}% — 채널 경쟁 발생 중'
-            '${d.band.isNotEmpty ? "\n현재 대역: ${d.band}" : ""}',
-        action: coAction,
-        badgeColor: Colors.orange,
-      );
-    }
-    // 로밍 빈도: 에이전트 윈도우 값 우선, 없으면 대시보드 자체 카운팅 사용
-    final effectiveRoamCount = d.roamCount10min > 0 ? d.roamCount10min : d.recentRoamingCount;
-    final roamWindow = d.roamCount10min > 0 ? '10분' : '5분';
-    if (effectiveRoamCount >= _roamingFreq) {
-      return DiagnosisResult(
-        layer: FaultLayer.ap,
-        summary: '잦은 로밍 (${effectiveRoamCount}회/$roamWindow)',
-        detail: '최근 $roamWindow간 ${effectiveRoamCount}회 로밍 — Sticky Client 또는 커버리지 경계\n'
-            '※ 로밍 자체는 정상이나 빈도가 높으면 경계 구간 체류 또는 AP 신호 불균형',
-        action: 'MOXA roamingThreshold5G 확인 (-75dBm 권장)\n'
-            '→ roamingDifference5G 8 이상 권장 (핑퐁 방지)\n'
-            '→ 해당 구역 AP 커버리지 및 출력 재점검',
-        badgeColor: Colors.orange,
-      );
-    }
-    // Ping: 60초 평균 우선 사용 (순간값 스파이크 오탐 방지)
-    final effectivePing = d.pingAvg60s > 0 ? d.pingAvg60s : d.currentPing;
-    final pingLabel = d.pingAvg60s > 0 ? '${effectivePing.toInt()}ms avg(60s)' : '${effectivePing.toInt()}ms';
-    if (effectivePing > _pingCritMs) {
-      return DiagnosisResult(
-        layer: FaultLayer.network,
-        summary: 'Ping 심각 지연 ($pingLabel)',
-        detail: '60초 평균 핑 ${effectivePing.toInt()}ms — 지속적 네트워크 불량\n'
-            '(로밍 중 순간 스파이크는 정상. 이 경고는 지속적 지연을 의미)',
-        action: '스위치 STP 루프 점검\n→ QoS 정책 적용 여부 확인\n→ 백본 스위치 포트 에러 카운터 확인',
-        badgeColor: Colors.red,
-      );
-    }
-    if (effectivePing > _pingHighMs) {
-      return DiagnosisResult(
-        layer: FaultLayer.network,
-        summary: 'Ping 지연 ($pingLabel)',
-        detail: '60초 평균 핑 ${effectivePing.toInt()}ms — 성능 저하 구간\n'
-            '(로밍 직후 1~2초 스파이크는 정상이며 이 경고 대상 아님)',
-        action: 'AP 채널 간섭 또는 로밍 빈도 확인\n→ 네트워크 대역폭 및 채널 점검',
+        alertLevel: AlertLevel.warning,
+        summary: '[경고] 패킷 손실 ${effectiveLoss.toInt()}%',
+        detail: '60초 평균 패킷 손실 ${effectiveLoss.toStringAsFixed(1)}%\n'
+            'AP 경계 구간 체류 또는 채널 간섭 의심',
+        action: 'AP 경계 구간 커버리지 재검토\n'
+            '→ MOXA Tx Power 조정\n'
+            '→ 로봇 동선 상 AP 경계 위치 확인',
         badgeColor: Colors.amber,
       );
     }
+    if (d.rssiAvailable && d.currentRssi < _rssiWarn) {
+      return DiagnosisResult(
+        layer: FaultLayer.ap,
+        alertLevel: AlertLevel.warning,
+        summary: '[경고] 신호 약함 (${d.currentRssi}dBm)',
+        detail: 'RSSI ${d.currentRssi} dBm — 로밍 발생 필요 구간\n'
+            '현재 운영은 정상이나 AP 경계 근처 위치',
+        action: 'MOXA roamingThreshold5G -75dBm 확인\n'
+            '→ 로밍이 안 된다면 roamingDifference 조정',
+        badgeColor: Colors.amber,
+      );
+    }
+    if (d.txRetryRate >= 0 && d.txRetryRate > _retryWarn) {
+      final localized = _isLocalizedInterference(d, allRobots);
+      final isLocal = localized == true;
+      return DiagnosisResult(
+        layer: FaultLayer.network,
+        alertLevel: AlertLevel.warning,
+        summary: '[경고] ${isLocal ? "국소 간섭" : "채널 간섭"} (Retry ${d.txRetryRate.toInt()}%)',
+        detail: isLocal
+            ? '이 로봇 위치 특화 간섭 의심 (Retry ${d.txRetryRate.toStringAsFixed(1)}%)\n'
+              '같은 AP 다른 로봇은 정상'
+            : 'TX Retry ${d.txRetryRate.toStringAsFixed(1)}% — 채널 경쟁 발생\n'
+              '${d.band.isNotEmpty ? "대역: ${d.band}" : ""}',
+        action: isLocal
+            ? '로봇 주변 금속 / EMI 발생 장비 점검\n'
+              '→ MOXA 안테나 위치 확인'
+            : 'AP 채널 분리 확인\n→ 비중복 채널 사용 확인',
+        badgeColor: Colors.amber,
+      );
+    }
+    if (effectivePing > _pingWarn) {
+      final label = d.pingAvg60s > 0 ? '${effectivePing.toInt()}ms(60s평균)' : '${effectivePing.toInt()}ms';
+      return DiagnosisResult(
+        layer: FaultLayer.network,
+        alertLevel: AlertLevel.warning,
+        summary: '[경고] Ping $label',
+        detail: '60초 평균 Ping ${effectivePing.toInt()}ms — 제어 응답 다소 지연\n'
+            '로밍 직후 순간 스파이크는 정상, 지속 시 확인 필요',
+        action: 'AP 채널 간섭 또는 백본 부하 확인\n'
+            '→ 네트워크 대역폭 및 채널 점검',
+        badgeColor: Colors.amber,
+      );
+    }
+
+    // ════════════════════════════════════════════════════════
+    // 🔵 주의 — 환경 불량, AMR 운영 영향 없음
+    // ════════════════════════════════════════════════════════
+    if (!d.rssiAvailable) {
+      return DiagnosisResult(
+        layer: FaultLayer.moxa,
+        alertLevel: AlertLevel.caution,
+        summary: '[주의] SNMP 미수신',
+        detail: 'MOXA RSSI/채널 데이터 없음\n'
+            '운영엔 영향 없으나 신호 품질 측정 불가',
+        action: 'sudo systemctl status moxa-poller\n'
+            '→ MOXA 웹UI: SNMP Enable + Save + 재부팅',
+        badgeColor: Colors.indigo,
+      );
+    }
+    if (effectivePing > _pingCaution) {
+      final label = d.pingAvg60s > 0 ? '${effectivePing.toInt()}ms(60s평균)' : '${effectivePing.toInt()}ms';
+      return DiagnosisResult(
+        layer: FaultLayer.network,
+        alertLevel: AlertLevel.caution,
+        summary: '[주의] Ping $label — 운영 정상',
+        detail: '60초 평균 Ping ${effectivePing.toInt()}ms\n'
+            'AMR 물류 운영에 실질 영향 없는 수준\n'
+            '로밍 직후 순간 스파이크 포함 시 더 높게 측정될 수 있음',
+        action: '지속 상승 시 채널 간섭 또는 부하 확인\n'
+            '→ 당장 조치 불필요',
+        badgeColor: Colors.indigo,
+      );
+    }
+
+    // ════════════════════════════════════════════════════════
+    // 🟢 정상
+    // ════════════════════════════════════════════════════════
     return const DiagnosisResult(
       layer: FaultLayer.normal,
+      alertLevel: AlertLevel.normal,
       summary: '정상',
-      detail: '모든 계층 정상 동작 중',
+      detail: '모든 계층 정상 동작 중\n'
+          '※ 로밍(AP 전환)은 이동 중 정상 현상',
       action: '-',
       badgeColor: Colors.green,
     );
@@ -342,6 +430,16 @@ class RobotData {
   int    roamCount10min = 0;
   String latencySrc60s  = "";
 
+  // ── 연속 실패 / 실질 단절 감지 ────────────────────────────
+  int  pingFailStreak = 0;     // 연속 ping 실패 횟수 (1~2=순단/로밍, 3+=실질단절)
+  bool sustainedLoss  = false; // 3회 이상 연속 실패 = 실질 단절
+
+  // ── Ping-pong 로밍 감지 (에이전트 → 대시보드) ──────────────
+  bool   pingpong     = false;   // 에이전트가 감지한 ping-pong 여부
+  String pingpongPair = "";      // ping-pong 대상 AP 쌍 문자열
+  // 대시보드 자체 로밍 이력 (에이전트 미지원 시 fallback)
+  final List<Map<String, dynamic>> _roamingHistory = [];  // {from, to, time}
+
   // ── 서버 진단 결과 (amr_diagnostics v2) ─────────────────────
   bool   diagConnected      = true;
   int    diagDisconnect1h   = 0;    // 1시간 내 끊김 횟수
@@ -380,6 +478,42 @@ class RobotData {
   int get recentRoamingCount {
     final cutoff = DateTime.now().subtract(const Duration(minutes: 5));
     return _roamingTimestamps.where((t) => t.isAfter(cutoff)).length;
+  }
+
+  /// 대시보드 자체 ping-pong 감지 (에이전트 미지원 구형 agent fallback)
+  /// 최근 5분 이력에서 동일 AP 쌍이 3회 이상 교대 전환되면 true
+  bool get dashboardPingpong {
+    const minBounces = 3;
+    final cutoff = DateTime.now().subtract(const Duration(minutes: 5));
+    final recent = _roamingHistory
+        .where((e) => (e['time'] as DateTime).isAfter(cutoff))
+        .map((e) => e['to'] as String)
+        .toList();
+    if (recent.length < minBounces) return false;
+    final last = recent.length > minBounces + 1
+        ? recent.sublist(recent.length - (minBounces + 1))
+        : recent;
+    if (last.toSet().length != 2) return false;
+    for (int i = 1; i < last.length; i++) {
+      if (last[i] == last[i - 1]) return false;
+    }
+    return true;
+  }
+
+  String get dashboardPingpongPair {
+    if (!dashboardPingpong) return "";
+    const minBounces = 3;
+    final cutoff = DateTime.now().subtract(const Duration(minutes: 5));
+    final recent = _roamingHistory
+        .where((e) => (e['time'] as DateTime).isAfter(cutoff))
+        .map((e) => e['to'] as String)
+        .toList();
+    final last = recent.length > minBounces + 1
+        ? recent.sublist(recent.length - (minBounces + 1))
+        : recent;
+    final bssids = last.toSet().toList()..sort();
+    String trimBssid(String s) => s.length > 11 ? s.substring(0, 11) : s;
+    return "${trimBssid(bssids[0])} ↔ ${trimBssid(bssids[1])}";
   }
 
   void update(Map<String, dynamic> json) {
@@ -423,6 +557,12 @@ class RobotData {
     if (json['ping_loss_pct']    != null) pingLossPct   = (json['ping_loss_pct']    as num).toDouble();
     if (json['roam_count_10min'] != null) roamCount10min = (json['roam_count_10min'] as num).toInt();
     if (json['latency_src_60s']  != null) latencySrc60s = json['latency_src_60s'].toString();
+    // 연속 실패 / 실질 단절 (에이전트 v2+)
+    if (json['ping_fail_streak'] != null) pingFailStreak = (json['ping_fail_streak'] as num).toInt();
+    if (json['sustained_loss']   != null) sustainedLoss  = json['sustained_loss'] as bool;
+    // Ping-pong 로밍 (에이전트 v2+)
+    if (json['pingpong']      != null) pingpong     = json['pingpong']      as bool;
+    if (json['pingpong_pair'] != null) pingpongPair = json['pingpong_pair'].toString();
 
     final rssiRaw = json['rssi']?.toString().replaceAll('dBm', '').trim() ?? '';
     final rssiParsed = int.tryParse(rssiRaw);
@@ -430,12 +570,19 @@ class RobotData {
     int newRssi = rssiParsed ?? 0;   // N/A → 0 (임계값 오탐 방지)
 
     // ── 로밍 감지 ──────────────────────────────────────────
-    if (currentBssid.isNotEmpty && currentBssid != json['bssid'] && json['bssid'] != "Disconnected") {
-      _addLog("ROAM", "로밍: $currentBssid ➔ ${json['bssid']} (Ch: $currentChannel)");
-      _roamingTimestamps.add(DateTime.now());
-      _roamingTimestamps.removeWhere((t) => DateTime.now().difference(t).inMinutes > 30);
+    final newBssid = json['bssid'] as String? ?? "";
+    if (currentBssid.isNotEmpty &&
+        currentBssid != newBssid &&
+        newBssid != "Disconnected" && newBssid != "Error" && newBssid != "Unknown") {
+      _addLog("ROAM", "로밍: $currentBssid ➔ $newBssid (Ch: $currentChannel)");
+      final now = DateTime.now();
+      _roamingTimestamps.add(now);
+      _roamingTimestamps.removeWhere((t) => now.difference(t).inMinutes > 30);
+      // 대시보드 자체 ping-pong 감지용 이력 (최근 30건)
+      _roamingHistory.add({'from': currentBssid, 'to': newBssid, 'time': now});
+      if (_roamingHistory.length > 30) _roamingHistory.removeAt(0);
     }
-    currentBssid = json['bssid'];
+    currentBssid = newBssid;
     currentRssi  = newRssi;
 
     // ── 상태 변화 감지 ─────────────────────────────────────
@@ -490,7 +637,7 @@ class RobotData {
     if (json['latest_log'] != null && json['latest_log'] != "None") {
       _addLog("AGT", "${json['latest_log']}");
     }
-    if (packetLoss > 5)        _addLog("WARN", "패킷 손실: ${packetLoss.toInt()}%");
+    if (packetLoss > 15)       _addLog("WARN", "패킷 손실: ${packetLoss.toInt()}% (로밍 순단 제외 기준)");
     if (reconnectCount > _prevReconnectCount) _addLog("SYS",  "에이전트 재연결 누적: $reconnectCount 회");
     _prevReconnectCount = reconnectCount;
 
@@ -512,7 +659,8 @@ class RobotData {
   }
 
   void _addLog(String type, String message) {
-    structuredLogs.insert(0, {"time": lastTime, "type": type, "message": message});
+    final nowIso = DateTime.now().toIso8601String().substring(0, 19).replaceFirst('T', ' ');
+    structuredLogs.insert(0, {"time": lastTime, "datetime": nowIso, "type": type, "message": message});
     eventLogs.insert(0, "[$lastTime][$type] $message");
     if (structuredLogs.length > 50) { structuredLogs.removeLast(); eventLogs.removeLast(); }
   }
@@ -576,7 +724,11 @@ class RobotData {
     }
     buf.writeln('$sep');
     buf.writeln('[로밍 통계]');
-    buf.writeln('최근 5분 로밍 : $recentRoamingCount 회');
+    buf.writeln('최근 로밍 횟수: ${roamCount10min > 0 ? "$roamCount10min 회 (10분)" : "$recentRoamingCount 회 (5분)"}');
+    if (pingpong || dashboardPingpong) {
+      final pair = pingpong ? pingpongPair : dashboardPingpongPair;
+      buf.writeln('Ping-pong     : 감지됨${pair.isNotEmpty ? " ($pair)" : ""}');
+    }
     buf.writeln();
     if (structuredLogs.isNotEmpty) {
       buf.writeln('$sep');
@@ -592,19 +744,20 @@ class RobotData {
   String _layerName(FaultLayer l) {
     switch (l) {
       case FaultLayer.normal:  return '정상';
-      case FaultLayer.ap:      return 'AP / 무선 계층';
-      case FaultLayer.moxa:    return 'MOXA 장비';
-      case FaultLayer.network: return '네트워크 계층';
+      case FaultLayer.ap:      return 'AP / 무선';
+      case FaultLayer.moxa:    return 'MOXA';
+      case FaultLayer.network: return '네트워크';
       case FaultLayer.server:  return '관제서버';
-      case FaultLayer.agent:   return '미니PC / 에이전트';
+      case FaultLayer.agent:   return '미니PC';
     }
   }
 
   String _rssiGrade(int r) {
     if (r >= -65) return '(우수)';
-    if (r >= -75) return '(양호)';
-    if (r >= -85) return '(약함 ⚠)';
-    return '(불량 ✗)';
+    if (r >= -72) return '(양호)';
+    if (r >= -78) return '(경고)';
+    if (r >= -83) return '(위험 ⚠)';
+    return '(음영 ✗)';
   }
 
   String _pingGrade(double ms) {
@@ -823,12 +976,19 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
     return Scaffold(
       backgroundColor: Colors.grey.shade200,
       appBar: AppBar(
-        title: const Text('AMR 인프라 실시간 관제 시스템',
+        title: const Text('세방전지 AMR 통신 관제',
             style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
         backgroundColor: Colors.indigo.shade900,
         elevation: 5,
         actions: [
           Row(children: [
+            // ── 보고서 내보내기 ──────────────────────────────
+            IconButton(
+              icon: const Icon(Icons.summarize_outlined, color: Colors.white70),
+              tooltip: '통신 현황 보고서 (CSV)',
+              onPressed: robots.isEmpty ? null : () => _showCsvReportDialog(context),
+            ),
+            const SizedBox(width: 4),
             // ── 뷰 전환 토글 ────────────────────────────────
             Container(
               margin: const EdgeInsets.symmetric(vertical: 8),
@@ -884,6 +1044,163 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
         ],
       ]),
     );
+  }
+
+  // ============================================================
+  // [D-REPORT] 통신 현황 보고서 내보내기 (CSV)
+  // ============================================================
+
+  void _showCsvReportDialog(BuildContext context) {
+    // 필터 상태
+    String period   = '오늘';        // 최근 1h / 3h / 6h / 오늘 / 전체
+    String severity = '전체';        // 전체 / 경고이상 / 위험이상 / 끊김만
+    String robotId  = '전체';        // 전체 / 개별 로봇 ID
+
+    final robotIds = ['전체', ...robots.keys.toList()..sort()];
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx2, setDlg) => AlertDialog(
+          title: const Text('통신 현황 보고서 내보내기',
+              style: TextStyle(fontWeight: FontWeight.bold)),
+          content: SizedBox(
+            width: 360,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('기간', style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                Wrap(spacing: 8, children: ['최근 1h', '최근 3h', '최근 6h', '오늘', '전체']
+                    .map((v) => ChoiceChip(
+                          label: Text(v),
+                          selected: period == v,
+                          onSelected: (_) => setDlg(() => period = v),
+                        ))
+                    .toList()),
+                const SizedBox(height: 16),
+                const Text('심각도 필터', style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                Wrap(spacing: 8, children: ['전체', '경고이상', '위험이상', '끊김만']
+                    .map((v) => ChoiceChip(
+                          label: Text(v),
+                          selected: severity == v,
+                          onSelected: (_) => setDlg(() => severity = v),
+                        ))
+                    .toList()),
+                const SizedBox(height: 16),
+                const Text('로봇', style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                DropdownButton<String>(
+                  value: robotId,
+                  isExpanded: true,
+                  items: robotIds.map((id) => DropdownMenuItem(value: id, child: Text(id))).toList(),
+                  onChanged: (v) => setDlg(() => robotId = v!),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx2),
+              child: const Text('취소'),
+            ),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.download),
+              label: const Text('CSV 다운로드'),
+              onPressed: () {
+                Navigator.pop(ctx2);
+                _downloadCsv(period, severity, robotId);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 필터 조건에 맞는 이벤트를 CSV로 생성
+  String _generateCsv(String period, String severity, String robotId) {
+    final now = DateTime.now();
+
+    DateTime? cutoff;
+    switch (period) {
+      case '최근 1h': cutoff = now.subtract(const Duration(hours: 1)); break;
+      case '최근 3h': cutoff = now.subtract(const Duration(hours: 3)); break;
+      case '최근 6h': cutoff = now.subtract(const Duration(hours: 6)); break;
+      case '오늘':
+        cutoff = DateTime(now.year, now.month, now.day); break;
+      default: cutoff = null; // 전체
+    }
+
+    // 심각도 필터: type 기반 — CRIT/WARN/ROAM/STATUS/INFO/AGT/SYS
+    bool typeMatches(String type) {
+      switch (severity) {
+        case '끊김만':   return type == 'CRIT';
+        case '위험이상': return type == 'CRIT' || type == 'WARN';
+        case '경고이상': return type == 'CRIT' || type == 'WARN' || type == 'ROAM';
+        default: return true; // 전체
+      }
+    }
+
+    // 헤더
+    final rows = <String>[];
+    rows.add('날짜시간,로봇ID,유형,메시지');
+
+    final targetRobots = robotId == '전체'
+        ? robots.values.toList()
+        : [if (robots.containsKey(robotId)) robots[robotId]!];
+
+    for (final robot in targetRobots) {
+      for (final log in robot.structuredLogs) {
+        final dateStr = log['datetime'] as String? ?? '';
+        if (dateStr.isEmpty) continue;
+
+        if (cutoff != null) {
+          final dt = DateTime.tryParse(dateStr);
+          if (dt == null || dt.isBefore(cutoff)) continue;
+        }
+
+        final type = log['type'] as String? ?? '';
+        if (!typeMatches(type)) continue;
+
+        // CSV 이스케이프
+        String esc(String s) {
+          if (s.contains(',') || s.contains('"') || s.contains('\n')) {
+            return '"${s.replaceAll('"', '""')}"';
+          }
+          return s;
+        }
+
+        rows.add([
+          esc(dateStr),
+          esc(robot.id),
+          esc(type),
+          esc(log['message'] as String? ?? ''),
+        ].join(','));
+      }
+    }
+
+    // UTF-8 BOM 추가 (Excel 한글 깨짐 방지)
+    return '\uFEFF${rows.join('\n')}';
+  }
+
+  /// CSV 생성 후 브라우저 다운로드 트리거
+  void _downloadCsv(String period, String severity, String robotId) {
+    final csv = _generateCsv(period, severity, robotId);
+    final now = DateTime.now();
+    final stamp = '${now.year}${now.month.toString().padLeft(2,'0')}${now.day.toString().padLeft(2,'0')}'
+        '_${now.hour.toString().padLeft(2,'0')}${now.minute.toString().padLeft(2,'0')}';
+    final filename = 'amr_report_${stamp}.csv';
+
+    final bytes = const Utf8Encoder().convert(csv);
+    final blob = html.Blob([bytes], 'text/csv;charset=utf-8');
+    final url  = html.Url.createObjectUrlFromBlob(blob);
+    html.AnchorElement(href: url)
+      ..setAttribute('download', filename)
+      ..click();
+    html.Url.revokeObjectUrl(url);
   }
 
   // ============================================================
@@ -1383,7 +1700,7 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
           )),
         ]),
         // 권장 조치 배너
-        if (diag.layer != FaultLayer.normal) ...[
+        if (diag.alertLevel != AlertLevel.normal) ...[
           const SizedBox(height: 8),
           _buildActionBanner(diag),
         ],
@@ -1778,7 +2095,7 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
       final diag = DiagnosisEngine.analyze(d, allRobots: robots);
       final stale = d.lastReceived != null &&
           DateTime.now().difference(d.lastReceived!).inSeconds > _dataTimeoutSec;
-      return diag.layer == FaultLayer.normal && !stale;
+      return diag.alertLevel == AlertLevel.normal && !stale;
     }).length;
     final alertCount = robots.length - normalCount;
 
@@ -1810,7 +2127,7 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
               final diag = DiagnosisEngine.analyze(data, allRobots: robots);
               final isStale = data.lastReceived != null &&
                   DateTime.now().difference(data.lastReceived!).inSeconds > _dataTimeoutSec;
-              final isNormal = diag.layer == FaultLayer.normal && !isStale;
+              final isNormal = diag.alertLevel == AlertLevel.normal && !isStale;
               final shortId = data.id.replaceAll('sebang', '');
               final rssiText = data.rssiAvailable ? '${data.currentRssi}' : 'N/A';
               final bgColor = isStale
@@ -1902,7 +2219,7 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(16),
         side: BorderSide(
-          color: diag.layer == FaultLayer.normal ? Colors.transparent : diag.badgeColor,
+          color: diag.alertLevel == AlertLevel.normal ? Colors.transparent : diag.badgeColor,
           width: 3,
         ),
       ),
@@ -2036,7 +2353,7 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
               ]),
 
               // ── 권장 조치 배너 ───────────────────────────────────
-              if (diag.layer != FaultLayer.normal) ...[
+              if (diag.alertLevel != AlertLevel.normal) ...[
                 const SizedBox(height: 16),
                 _buildActionBanner(diag),
               ],
@@ -2462,6 +2779,7 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
   }
 
   // ── 공용 헬퍼 ────────────────────────────────────────────────
+  /// AlertLevel 기반 아이콘 — 심각도를 직관적으로 표현
   IconData _diagIcon(FaultLayer layer) {
     switch (layer) {
       case FaultLayer.normal:  return Icons.check_circle;
@@ -2470,6 +2788,26 @@ class _MonitorDashboardState extends State<MonitorDashboard> {
       case FaultLayer.network: return Icons.lan;
       case FaultLayer.server:  return Icons.cloud_off;
       case FaultLayer.agent:   return Icons.computer;
+    }
+  }
+
+  IconData _alertIcon(AlertLevel level) {
+    switch (level) {
+      case AlertLevel.offline: return Icons.signal_wifi_off;
+      case AlertLevel.danger:  return Icons.warning_rounded;
+      case AlertLevel.warning: return Icons.warning_amber_rounded;
+      case AlertLevel.caution: return Icons.info_outline;
+      case AlertLevel.normal:  return Icons.check_circle_outline;
+    }
+  }
+
+  String _alertLabel(AlertLevel level) {
+    switch (level) {
+      case AlertLevel.offline: return '끊김';
+      case AlertLevel.danger:  return '위험';
+      case AlertLevel.warning: return '경고';
+      case AlertLevel.caution: return '주의';
+      case AlertLevel.normal:  return '정상';
     }
   }
 
